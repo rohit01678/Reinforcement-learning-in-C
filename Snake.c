@@ -162,19 +162,28 @@ b32 sub(matrix* out, const matrix* a, const matrix* b) {
     return true;
 }
 
-void _mat_mul_nn(matrix* out, const matrix* a, const matrix* b) {
+// NOTE on loop order: reordered to (i, k, j) instead of (i, j, k).
+// This walks b->data and out->data contiguously in the innermost loop
+// (stride 1) instead of striding through b by b->cols on every step.
+// That's the difference between "cache-friendly" and "cache-hostile"
+// access, and it lets the compiler auto-vectorize the inner loop.
+// This is the dominant matmul case: every forward-pass layer
+// (var_matmul_forward) always calls this exact case.
+void _mat_mul_nn(matrix* restrict out, const matrix* restrict a, const matrix* restrict b) {
     for (u64 i = 0; i < out->rows; i++) {
-        for (u64 j = 0; j < out->cols; j++) {
-            f32 sum = 0.0f;
-            for (u64 k = 0; k < a->cols; k++) {
-                sum += a->data[k + i * a->cols] * b->data[j + k * b->cols];
+        f32* restrict out_row = out->data + i * out->cols;
+        const f32* restrict a_row = a->data + i * a->cols;
+        for (u64 k = 0; k < a->cols; k++) {
+            f32 aik = a_row[k];
+            const f32* restrict b_row = b->data + k * b->cols;
+            for (u64 j = 0; j < out->cols; j++) {
+                out_row[j] += aik * b_row[j];
             }
-            out->data[j + i * out->cols] += sum;
         }
     }
 }
 
-void _mat_mul_nt(matrix* out, const matrix* a, const matrix* b) {
+void _mat_mul_nt(matrix* restrict out, const matrix* restrict a, const matrix* restrict b) {
     for (u64 i = 0; i < out->rows; i++) {
         for (u64 j = 0; j < out->cols; j++) {
             f32 sum = 0.0f;
@@ -186,7 +195,7 @@ void _mat_mul_nt(matrix* out, const matrix* a, const matrix* b) {
     }
 }
 
-void _mat_mul_tn(matrix* out, const matrix* a, const matrix* b) {
+void _mat_mul_tn(matrix* restrict out, const matrix* restrict a, const matrix* restrict b) {
     for (u64 i = 0; i < out->rows; i++) {
         for (u64 j = 0; j < out->cols; j++) {
             f32 sum = 0.0f;
@@ -198,7 +207,7 @@ void _mat_mul_tn(matrix* out, const matrix* a, const matrix* b) {
     }
 }
 
-void _mat_mul_tt(matrix* out, const matrix* a, const matrix* b) {
+void _mat_mul_tt(matrix* restrict out, const matrix* restrict a, const matrix* restrict b) {
     for (u64 i = 0; i < out->rows; i++) {
         for (u64 j = 0; j < out->cols; j++) {
             f32 sum = 0.0f;
@@ -236,19 +245,24 @@ b32 relu(matrix* out, const matrix* in) {
     return true;
 }
 
+// Per-column softmax: each column of `in` is an independent probability
+// distribution (batch dimension = columns).
 b32 softmax(matrix* out, const matrix* in) {
     if (out->rows != in->rows || out->cols != in->cols) return false;
-    u64 size = (u64)out->rows * out->cols;
+    for (u32 j = 0; j < in->cols; j++) {
+        f32 max_val = in->data[j];
+        for (u32 i = 1; i < in->rows; i++)
+            max_val = MAX(max_val, in->data[j + i * in->cols]);
 
-    f32 max_value = in->data[0];
-    for (u64 i = 1; i < size; i++) max_value = MAX(max_value, in->data[i]);
-
-    f32 sum = 0.0f;
-    for (u64 i = 0; i < size; i++) {
-        out->data[i] = expf(in->data[i] - max_value);
-        sum += out->data[i];
+        f32 sum = 0.0f;
+        for (u32 i = 0; i < in->rows; i++) {
+            f32 e = expf(in->data[j + i * in->cols] - max_val);
+            out->data[j + i * in->cols] = e;
+            sum += e;
+        }
+        for (u32 i = 0; i < in->rows; i++)
+            out->data[j + i * in->cols] /= sum;
     }
-    scale(out, 1.0f / sum);
     return true;
 }
 
@@ -292,12 +306,15 @@ b32 softmax_add_grad(matrix* out, const matrix* softmax_out, const matrix* grad)
     if (out->rows != softmax_out->rows || out->cols != softmax_out->cols) return false;
     if (grad->rows != softmax_out->rows || grad->cols != softmax_out->cols) return false;
 
-    u64 size = (u64)softmax_out->rows * softmax_out->cols;
-    f32 dot = 0.0f;
-    for (u64 i = 0; i < size; i++) dot += grad->data[i] * softmax_out->data[i];
+    for (u32 j = 0; j < softmax_out->cols; j++) {
+        f32 dot = 0.0f;
+        for (u32 i = 0; i < softmax_out->rows; i++)
+            dot += grad->data[j + i * grad->cols] * softmax_out->data[j + i * softmax_out->cols];
 
-    for (u64 i = 0; i < size; i++) {
-        out->data[i] += softmax_out->data[i] * (grad->data[i] - dot);
+        for (u32 i = 0; i < softmax_out->rows; i++) {
+            u32 idx = j + i * softmax_out->cols;
+            out->data[idx] += softmax_out->data[idx] * (grad->data[idx] - dot);
+        }
     }
     return true;
 }
@@ -365,10 +382,47 @@ static void var_softmax_backward(Var* var) {
     }
 }
 
+// --- Plain elementwise add (equal-shape inputs) ---
 static void var_add_forward(Var* var) { add(var->val, var->inputs[0]->val, var->inputs[1]->val); }
 static void var_add_backward(Var* var) {
     if (var->inputs[0] && (var->inputs[0]->flags & VAR_FLAG_REQUIRES_GRAD)) add(var->inputs[0]->grad, var->inputs[0]->grad, var->grad);
     if (var->inputs[1] && (var->inputs[1]->flags & VAR_FLAG_REQUIRES_GRAD)) add(var->inputs[1]->grad, var->inputs[1]->grad, var->grad);
+}
+
+// --- Bias add: broadcasts a (rows,1) bias across a (rows,BATCH) input ---
+static void var_bias_add_forward(Var* var) {
+    matrix* a = var->inputs[0]->val;
+    matrix* bias = var->inputs[1]->val;
+    for (u32 i = 0; i < a->rows; i++) {
+        f32 bi = bias->data[i];
+        f32* out_row = var->val->data + (u64)i * a->cols;
+        const f32* a_row = a->data + (u64)i * a->cols;
+        for (u32 j = 0; j < a->cols; j++)
+            out_row[j] = a_row[j] + bi;
+    }
+}
+
+static void var_bias_add_backward(Var* var) {
+    Var* a = var->inputs[0];
+    Var* bias = var->inputs[1];
+    matrix* grad = var->grad;
+
+    if (a->flags & VAR_FLAG_REQUIRES_GRAD) add(a->grad, a->grad, grad);
+
+    if (bias->flags & VAR_FLAG_REQUIRES_GRAD) {
+        for (u32 i = 0; i < grad->rows; i++) {
+            f32 sum = 0.0f;
+            const f32* grad_row = grad->data + (u64)i * grad->cols;
+            for (u32 j = 0; j < grad->cols; j++) sum += grad_row[j];
+            bias->grad->data[i] += sum;
+        }
+    }
+}
+
+static b32 var_shape_bias_add(Var* a, Var* b, u32* rows, u32* cols) {
+    if (a == NULL || b == NULL || b->val->cols != 1 || b->val->rows != a->val->rows) return false;
+    *rows = a->val->rows; *cols = a->val->cols;
+    return true;
 }
 
 static void var_sub_forward(Var* var) { sub(var->val, var->inputs[0]->val, var->inputs[1]->val); }
@@ -406,6 +460,7 @@ static b32 var_shape_matmul(Var* a, Var* b, u32* rows, u32* cols) {
 const VarType VAR_TYPE_RELU = { "relu", 1, var_shape_same, var_relu_forward, var_relu_backward };
 const VarType VAR_TYPE_SOFTMAX = { "softmax", 1, var_shape_same, var_softmax_forward, var_softmax_backward };
 const VarType VAR_TYPE_ADD = { "add", 2, var_shape_same, var_add_forward, var_add_backward };
+const VarType VAR_TYPE_BIAS_ADD = { "bias_add", 2, var_shape_bias_add, var_bias_add_forward, var_bias_add_backward };
 const VarType VAR_TYPE_SUB = { "sub", 2, var_shape_same, var_sub_forward, var_sub_backward };
 const VarType VAR_TYPE_MATMUL = { "matmul", 2, var_shape_matmul, var_matmul_forward, var_matmul_backward };
 const VarType VAR_TYPE_REINFORCE_LOSS = { "reinforce_loss", 2, var_shape_same, var_reinforce_forward, var_reinforce_backward };
@@ -441,6 +496,7 @@ static Var* create_node(mem_arena* arena, model_state* model, const VarType* typ
 Var* var_relu(mem_arena* arena, model_state* model, Var* input) { return create_node(arena, model, &VAR_TYPE_RELU, input, NULL); }
 Var* var_softmax(mem_arena* arena, model_state* model, Var* input) { return create_node(arena, model, &VAR_TYPE_SOFTMAX, input, NULL); }
 Var* var_add(mem_arena* arena, model_state* model, Var* a, Var* b) { return create_node(arena, model, &VAR_TYPE_ADD, a, b); }
+Var* var_bias_add(mem_arena* arena, model_state* model, Var* a, Var* b) { return create_node(arena, model, &VAR_TYPE_BIAS_ADD, a, b); }
 Var* var_sub(mem_arena* arena, model_state* model, Var* a, Var* b) { return create_node(arena, model, &VAR_TYPE_SUB, a, b); }
 Var* var_matmul(mem_arena* arena, model_state* model, Var* a, Var* b) { return create_node(arena, model, &VAR_TYPE_MATMUL, a, b); }
 Var* var_reinforce_loss(mem_arena* arena, model_state* model, Var* probs, Var* rt) { return create_node(arena, model, &VAR_TYPE_REINFORCE_LOSS, probs, rt); }
@@ -519,10 +575,22 @@ void backward_pass(Graph* graph) {
 }
 
 // ============================================================================
+// BATCHING CONFIG
+// ============================================================================
+// Both rollout and training share this batch width. Rollout batches all
+// trajectories in one buffer together (one batch = one full episode step
+// across every trajectory). Training batches flattened transitions into
+// chunks of this size. Using one constant lets both phases reuse the same
+// compute graph shapes.
+#define BATCH 64
+#define BUFFER_SIZE BATCH
+#define EPISODE_LEN 100
+
+// ============================================================================
 // POLICY MODEL CREATION
 // ============================================================================
-void create_actor_model(mem_arena* arena, model_state* model) {
-    Var* input = var_create(arena, model, 76, 1, VAR_FLAG_NONE);
+void create_actor_model(mem_arena* arena, model_state* model, u32 batch) {
+    Var* input = var_create(arena, model, 76, batch, VAR_FLAG_NONE);
     model->input = input;
 
     Var* W0 = var_create(arena, model, 128, 76, VAR_FLAG_PARAMETER | VAR_FLAG_REQUIRES_GRAD);
@@ -543,20 +611,20 @@ void create_actor_model(mem_arena* arena, model_state* model) {
     fill_rand(W2->val, -bound2, bound2);
 
     Var* z0_a = var_matmul(arena, model, W0, input);
-    Var* z0_b = var_add(arena, model, z0_a, b0);
+    Var* z0_b = var_bias_add(arena, model, z0_a, b0);
     Var* a0 = var_relu(arena, model, z0_b);
 
     Var* z1_a = var_matmul(arena, model, W1, a0);
-    Var* z1_b = var_add(arena, model, z1_a, b1);
+    Var* z1_b = var_bias_add(arena, model, z1_a, b1);
     Var* a1 = var_relu(arena, model, z1_b);
 
     Var* z2_a = var_matmul(arena, model, W2, a1);
-    Var* z2_b = var_add(arena, model, z2_a, b2);
+    Var* z2_b = var_bias_add(arena, model, z2_a, b2);
 
     Var* output = var_softmax(arena, model, z2_b);
     model->output = output;
 
-    Var* advantage = var_create(arena, model, 5, 1, VAR_FLAG_NONE);
+    Var* advantage = var_create(arena, model, 5, batch, VAR_FLAG_NONE);
     model->advantage = advantage;
 
     Var* cost = var_reinforce_loss(arena, model, output, advantage);
@@ -569,18 +637,19 @@ void create_actor_model(mem_arena* arena, model_state* model) {
 typedef enum { LEFT = 0, RIGHT = 1, UP = 2, DOWN = 3, NONE = 4 } ACTION;
 typedef struct { i32 x, y; } State;
 
+// Static grid configuration, shared across all trajectories in a batch.
 typedef struct {
-    State snake;
-    State food;
-    f32 score;
-    u32 foods_eaten;
     u32 rows, cols, grid_size;
-    u64 steps;
-    ACTION pov;
 } SnakeENV;
 
-#define BUFFER_SIZE 64
-#define EPISODE_LEN 100
+// Per-trajectory dynamic state for a full batch of BATCH independent games.
+typedef struct {
+    State snake[BATCH];
+    State food[BATCH];
+    ACTION pov[BATCH];
+    b32 active[BATCH];
+    u32 foods_eaten[BATCH];
+} BatchEnv;
 
 typedef struct {
     State states[EPISODE_LEN];
@@ -606,10 +675,7 @@ SnakeENV* create_env(u32 grid_size) {
     u32 side = (u32)sqrtf((f32)grid_size);
     if (side * side != grid_size) { free(env); return NULL; }
 
-    env->snake = (State){ .x = 0, .y = 0 };
-    env->food = (State){ .x = 5, .y = 5 };
     env->rows = side; env->cols = side; env->grid_size = grid_size;
-    env->score = 0.0f; env->foods_eaten = 0; env->pov = RIGHT; env->steps = 0;
     return env;
 }
 
@@ -617,116 +683,154 @@ State get_random_food_loc(u32 cols, u32 rows) {
     return (State) { .x = (i32)randn(cols), .y = (i32)randn(rows) };
 }
 
-b32 game_over(SnakeENV* env) {
-    return env->snake.x < 0 || env->snake.x >= (i32)env->cols ||
-           env->snake.y < 0 || env->snake.y >= (i32)env->rows;
+b32 state_out_of_bounds(State s, u32 cols, u32 rows) {
+    return s.x < 0 || s.x >= (i32)cols || s.y < 0 || s.y >= (i32)rows;
 }
 
-f32 get_reward(SnakeENV* env) {
+void reset_batch_env(BatchEnv* benv, const SnakeENV* env) {
+    for (u32 i = 0; i < BATCH; i++) {
+        benv->snake[i] = (State){ .x = (i32)(env->cols / 2), .y = (i32)(env->rows / 2) };
+        do {
+            benv->food[i] = get_random_food_loc(env->cols, env->rows);
+        } while (benv->food[i].x == benv->snake[i].x && benv->food[i].y == benv->snake[i].y);
+        benv->pov[i] = RIGHT;
+        benv->active[i] = true;
+        benv->foods_eaten[i] = 0;
+    }
+}
+
+// Applies `action` to trajectory `i`, returns the reward, and updates
+// food/foods_eaten in place. Mirrors the original single-env get_reward,
+// generalized to operate on one column of a batch.
+f32 step_batch_env(BatchEnv* benv, u32 i, const SnakeENV* env, ACTION action) {
+    if (action == NONE) action = benv->pov[i];
+    if (action == LEFT) benv->snake[i].x -= 1;
+    else if (action == RIGHT) benv->snake[i].x += 1;
+    else if (action == UP) benv->snake[i].y += 1;
+    else if (action == DOWN) benv->snake[i].y -= 1;
+    benv->pov[i] = action;
+
     f32 reward = 0.0f;
-    if (env->snake.x == env->food.x && env->snake.y == env->food.y) {
+    if (benv->snake[i].x == benv->food[i].x && benv->snake[i].y == benv->food[i].y) {
         reward += 20.0f;
-        env->foods_eaten++;
+        benv->foods_eaten[i]++;
         State new_food;
         do {
             new_food = get_random_food_loc(env->cols, env->rows);
-        } while (new_food.x == env->snake.x && new_food.y == env->snake.y);
-        env->food = new_food;
+        } while (new_food.x == benv->snake[i].x && new_food.y == benv->snake[i].y);
+        benv->food[i] = new_food;
     }
-    if (env->snake.x < 0 || env->snake.x >= (i32)env->cols ||
-        env->snake.y < 0 || env->snake.y >= (i32)env->rows) {
+    if (state_out_of_bounds(benv->snake[i], env->cols, env->rows)) {
         reward -= 10.0f;
     }
     return reward;
 }
 
-void reset_state(SnakeENV* env) {
-    env->snake = (State){ .x = (i32)(env->cols / 2), .y = (i32)(env->rows / 2) };
-    do {
-        env->food = get_random_food_loc(env->cols, env->rows);
-    } while (env->food.x == env->snake.x && env->food.y == env->snake.y);
-    env->score = 0.0f; env->foods_eaten = 0; env->pov = RIGHT; env->steps = 0;
-}
-
-void take_action(SnakeENV* env, ACTION action) {
-    if (action == NONE) action = env->pov;
-    if (action == LEFT) env->snake.x -= 1;
-    else if (action == RIGHT) env->snake.x += 1;
-    else if (action == UP) env->snake.y += 1;
-    else if (action == DOWN) env->snake.y -= 1;
-    else return;
-    env->pov = action;
-}
-
-ACTION sample_action(matrix* probs) {
-    f32 r = prng_randf();
-    f32 cdf = 0.0f;
-    u32 size = probs->rows * probs->cols;
-    for (u32 i = 0; i < size; i++) {
-        cdf += probs->data[i];
-        if (r <= cdf) return (ACTION)i;
-    }
-    return (ACTION)(size - 1);
-}
-
-void build_state_vector(matrix* in, State state, State food_state, ACTION pov, u32 cols, u32 grid_size) {
-    clear(in);
+// Writes a one-hot state encoding into column `col` of a (76, BATCH) matrix.
+void build_state_vector_col(matrix* in, u32 col, State state, State food_state, ACTION pov, u32 cols, u32 grid_size) {
     u32 snake_i = (u32)state.y * cols + (u32)state.x;
     u32 food_i = (u32)food_state.y * cols + (u32)food_state.x;
-    in->data[snake_i] = 1.0f;
-    in->data[grid_size + food_i] = 1.0f;
-    in->data[2 * grid_size + (u32)pov] = 1.0f;
+    in->data[col + (u64)snake_i * in->cols] = 1.0f;
+    in->data[col + (u64)(grid_size + food_i) * in->cols] = 1.0f;
+    in->data[col + (u64)(2 * grid_size + (u32)pov) * in->cols] = 1.0f;
+}
+
+// Samples an action from column `col` of a (rows, BATCH) probability matrix.
+ACTION sample_action_col(const matrix* probs, u32 col) {
+    f32 r = prng_randf();
+    f32 cdf = 0.0f;
+    for (u32 i = 0; i < probs->rows; i++) {
+        cdf += probs->data[col + (u64)i * probs->cols];
+        if (r <= cdf) return (ACTION)i;
+    }
+    return (ACTION)(probs->rows - 1);
 }
 
 void train(model_state* model, SnakeENV* env, mem_arena* arena) {
     (void)arena;
     u32 EPOCHS = 2000;
-    u32 rollout_size = BUFFER_SIZE;
     u32 episode_len = EPISODE_LEN;
     f32 gamma = 0.99f;
     f32 learning_rate = 0.05f;
 
     ReplayBuffer* buffer = calloc(1, sizeof(ReplayBuffer));
-    if (!buffer) return;
+    BatchEnv* benv = malloc(sizeof(BatchEnv));
+    if (!buffer || !benv) {
+        fprintf(stderr, "Failed to allocate training buffers!\n");
+        free(buffer);
+        free(benv);
+        return;
+    }
+
+    // Reused scratch space for the flattened per-epoch training set.
+    // Sized for the worst case: every trajectory runs the full episode.
+    u32 max_samples = BUFFER_SIZE * episode_len;
+    State* flat_state = malloc(sizeof(State) * max_samples);
+    State* flat_food = malloc(sizeof(State) * max_samples);
+    ACTION* flat_pov = malloc(sizeof(ACTION) * max_samples);
+    ACTION* flat_action = malloc(sizeof(ACTION) * max_samples);
+    f32* flat_advantage = malloc(sizeof(f32) * max_samples);
+
+    if (!flat_state || !flat_food || !flat_pov || !flat_action || !flat_advantage) {
+        fprintf(stderr, "Failed to allocate flattened sample buffers!\n");
+        free(buffer); free(benv);
+        free(flat_state); free(flat_food); free(flat_pov); free(flat_action); free(flat_advantage);
+        return;
+    }
 
     for (u32 epoch = 0; epoch < EPOCHS; epoch++) {
-        u32 foods_eaten = 0;
+        // ------------------------------------------------------------
+        // ROLLOUT: step all BATCH trajectories together at each
+        // timestep, doing exactly one forward pass per timestep
+        // instead of one per (trajectory, timestep) pair.
+        // ------------------------------------------------------------
+        reset_batch_env(benv, env);
+        for (u32 i = 0; i < BUFFER_SIZE; i++) buffer->trajectories[i].len = 0;
 
-        for (u32 i = 0; i < rollout_size; i++) {
-            reset_state(env);
-            Trajectory* traj = &buffer->trajectories[i];
-            traj->len = 0;
+        for (u32 t = 0; t < episode_len; t++) {
+            b32 any_active = false;
+            clear(model->input->val);
+            for (u32 i = 0; i < BATCH; i++) {
+                if (!benv->active[i]) continue;
+                any_active = true;
+                build_state_vector_col(model->input->val, i, benv->snake[i], benv->food[i], benv->pov[i], env->cols, env->grid_size);
+            }
+            if (!any_active) break;
 
-            for (u32 t = 0; t < episode_len; t++) {
-                State state = env->snake;
-                State food_state = env->food;
-                ACTION pov = env->pov;
+            forward_pass(&model->forward_graph);
 
-                build_state_vector(model->input->val, state, food_state, pov, env->cols, env->grid_size);
-                forward_pass(&model->forward_graph);
-                ACTION action = sample_action(model->output->val);
+            for (u32 i = 0; i < BATCH; i++) {
+                if (!benv->active[i]) continue;
 
-                take_action(env, action);
+                Trajectory* traj = &buffer->trajectories[i];
+                State state = benv->snake[i];
+                State food_state = benv->food[i];
+                ACTION pov = benv->pov[i];
 
-                f32 reward = get_reward(env);
-                env->score += reward;
-                b32 done = game_over(env);
+                ACTION action = sample_action_col(model->output->val, i);
+                f32 reward = step_batch_env(benv, i, env, action);
+                b32 done = state_out_of_bounds(benv->snake[i], env->cols, env->rows);
 
                 traj->states[t] = state;
                 traj->food_states[t] = food_state;
                 traj->povs[t] = pov;
                 traj->actions[t] = action;
                 traj->rewards[t] = reward;
-                traj->next_states[t] = env->snake;
+                traj->next_states[t] = benv->snake[i];
                 traj->dones[t] = done;
                 traj->len = t + 1;
 
-                if (done) break;
+                if (done) benv->active[i] = false;
             }
-            foods_eaten += env->foods_eaten;
         }
 
-        buffer->count = rollout_size;
+        u32 foods_eaten = 0;
+        for (u32 i = 0; i < BATCH; i++) foods_eaten += benv->foods_eaten[i];
+
+        // ------------------------------------------------------------
+        // RETURNS: unchanged, cheap sequential pass per trajectory.
+        // ------------------------------------------------------------
+        buffer->count = BUFFER_SIZE;
         u32 sample_count = 0;
         f32 average_return = 0.0f, return_sum = 0.0f, return_sq_sum = 0.0f;
 
@@ -747,23 +851,50 @@ void train(model_state* model, SnakeENV* env, mem_arena* arena) {
         f32 return_variance = return_sq_sum / (f32)sample_count - return_mean * return_mean;
         f32 return_std = sqrtf(MAX(return_variance, 0.0f));
 
+        // ------------------------------------------------------------
+        // FLATTEN: gather all transitions from all trajectories into
+        // contiguous arrays so they can be processed in batches.
+        // ------------------------------------------------------------
+        u32 idx = 0;
+        for (u32 b = 0; b < buffer->count; b++) {
+            Trajectory* traj = &buffer->trajectories[b];
+            for (u32 t = 0; t < traj->len; t++) {
+                flat_state[idx] = traj->states[t];
+                flat_food[idx] = traj->food_states[t];
+                flat_pov[idx] = traj->povs[t];
+                flat_action[idx] = traj->actions[t];
+                flat_advantage[idx] = (traj->returns[t] - return_mean) / (return_std + 1e-8f);
+                idx++;
+            }
+        }
+
+        // ------------------------------------------------------------
+        // TRAIN: process the flattened samples BATCH at a time.
+        // Gradients accumulate across chunks exactly as they did
+        // across individual samples before (backward_pass only
+        // clears non-parameter grads, never parameter grads).
+        // The last, possibly-partial chunk is zero-padded: padded
+        // columns have advantage == 0, so reinforce_add_grad
+        // contributes exactly zero gradient for them.
+        // ------------------------------------------------------------
         for (u32 i = 0; i < model->cost_graph.size; i++) {
             Var* cur = model->cost_graph.vars[i];
             if (cur->flags & VAR_FLAG_PARAMETER) clear(cur->grad);
         }
 
-        for (u32 b = 0; b < buffer->count; b++) {
-            Trajectory* traj = &buffer->trajectories[b];
-            for (u32 t = 0; t < traj->len; t++) {
-                build_state_vector(model->input->val, traj->states[t], traj->food_states[t], traj->povs[t], env->cols, env->grid_size);
+        for (u32 start = 0; start < sample_count; start += BATCH) {
+            u32 n = MIN(BATCH, sample_count - start);
 
-                clear(model->advantage->val);
-                f32 advantage = (traj->returns[t] - return_mean) / (return_std + 1e-8f);
-                model->advantage->val->data[traj->actions[t]] = advantage;
-
-                forward_pass(&model->cost_graph);
-                backward_pass(&model->cost_graph);
+            clear(model->input->val);
+            clear(model->advantage->val);
+            for (u32 c = 0; c < n; c++) {
+                u32 s = start + c;
+                build_state_vector_col(model->input->val, c, flat_state[s], flat_food[s], flat_pov[s], env->cols, env->grid_size);
+                model->advantage->val->data[c + (u64)flat_action[s] * model->advantage->val->cols] = flat_advantage[s];
             }
+
+            forward_pass(&model->cost_graph);
+            backward_pass(&model->cost_graph);
         }
 
         if (sample_count > 0) {
@@ -781,6 +912,8 @@ void train(model_state* model, SnakeENV* env, mem_arena* arena) {
         fflush(stdout);
     }
 
+    free(flat_state); free(flat_food); free(flat_pov); free(flat_action); free(flat_advantage);
+    free(benv);
     free(buffer);
 }
 
@@ -806,9 +939,15 @@ int main(void) {
         return 1;
     }
 
-    create_actor_model(arena, model);
+    create_actor_model(arena, model, BATCH);
     model->forward_graph = build_graph(arena, model, model->output);
     model->cost_graph = build_graph(arena, model, model->cost);
+
+    if (model->forward_graph.vars == NULL || model->cost_graph.vars == NULL) {
+        fprintf(stderr, "Failed to build compute graph!\n");
+        arena_destroy(arena);
+        return 1;
+    }
 
     SnakeENV* env = create_env(36);
     if (!env) {
