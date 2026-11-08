@@ -36,9 +36,9 @@ typedef double f64;
 // ============================================================================
 // MEMORY ARENA
 // ============================================================================
-#define ARENA_ALIGN (sizeof(void*))
-
+#define ARENA_ALIGN 64ULL
 typedef struct {
+    u8* raw;
     u8* memory;
     u64 capacity;
     u64 pos;
@@ -48,12 +48,13 @@ mem_arena* arena_create(u64 capacity) {
     mem_arena* arena = malloc(sizeof(mem_arena));
     if (arena == NULL) return NULL;
 
-    arena->memory = malloc(capacity);
-    if (arena->memory == NULL) {
+    arena->raw = malloc(capacity + ARENA_ALIGN);
+    if (arena->raw == NULL) {
         free(arena);
         return NULL;
     }
 
+    arena->memory = (u8*)ALIGN_UP_POW2((u64)(uintptr_t)arena->raw, ARENA_ALIGN);
     arena->capacity = capacity;
     arena->pos = 0;
     return arena;
@@ -61,7 +62,7 @@ mem_arena* arena_create(u64 capacity) {
 
 void arena_destroy(mem_arena* arena) {
     if (arena == NULL) return;
-    free(arena->memory);
+    free(arena->raw);
     free(arena);
 }
 
@@ -183,26 +184,38 @@ void _mat_mul_nn(matrix* restrict out, const matrix* restrict a, const matrix* r
     }
 }
 
+// Dot product with 8 independent accumulators. The compiler can map this
+// onto SIMD lanes without -ffast-math because the summation order is
+// explicit in the source.
+static inline f32 dot8(const f32* restrict x, const f32* restrict y, u64 n) {
+    f32 s[8] = { 0 };
+    u64 k = 0;
+    for (; k + 8 <= n; k += 8)
+        for (int l = 0; l < 8; l++) s[l] += x[k + l] * y[k + l];
+    f32 tail = 0.0f;
+    for (; k < n; k++) tail += x[k] * y[k];
+    return ((s[0] + s[4]) + (s[1] + s[5])) + ((s[2] + s[6]) + (s[3] + s[7])) + tail;
+}
+
+// out += a * b^T : both operands are walked along contiguous rows.
 void _mat_mul_nt(matrix* restrict out, const matrix* restrict a, const matrix* restrict b) {
     for (u64 i = 0; i < out->rows; i++) {
-        for (u64 j = 0; j < out->cols; j++) {
-            f32 sum = 0.0f;
-            for (u64 k = 0; k < a->cols; k++) {
-                sum += a->data[k + i * a->cols] * b->data[k + j * b->cols];
-            }
-            out->data[j + i * out->cols] += sum;
-        }
+        const f32* a_row = a->data + i * a->cols;
+        f32* out_row = out->data + i * out->cols;
+        for (u64 j = 0; j < out->cols; j++)
+            out_row[j] += dot8(a_row, b->data + j * b->cols, a->cols);
     }
 }
 
+// out += a^T * b : (i,k,j) order so the inner loop is stride-1 over b and out.
 void _mat_mul_tn(matrix* restrict out, const matrix* restrict a, const matrix* restrict b) {
     for (u64 i = 0; i < out->rows; i++) {
-        for (u64 j = 0; j < out->cols; j++) {
-            f32 sum = 0.0f;
-            for (u64 k = 0; k < a->rows; k++) {
-                sum += a->data[i + k * a->cols] * b->data[j + k * b->cols];
-            }
-            out->data[j + i * out->cols] += sum;
+        f32* restrict out_row = out->data + i * out->cols;
+        for (u64 k = 0; k < a->rows; k++) {
+            f32 aki = a->data[i + k * a->cols];
+            const f32* restrict b_row = b->data + k * b->cols;
+            for (u64 j = 0; j < out->cols; j++)
+                out_row[j] += aki * b_row[j];
         }
     }
 }
@@ -926,7 +939,7 @@ int main(void) {
     printf(">>> Program started. If you can read this line, your console is working. <<<\n");
     fflush(stdout);
 
-    mem_arena* arena = arena_create(GiB(1));
+    mem_arena* arena = arena_create(MiB(64));
     if (!arena) {
         fprintf(stderr, "Failed to allocate memory arena!\n");
         return 1;
