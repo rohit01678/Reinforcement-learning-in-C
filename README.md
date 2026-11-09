@@ -4,14 +4,16 @@ A from-scratch reinforcement learning implementation written in C. The project t
 
 ## Overview
 
-`Snake.c` contains the complete implementation:
+The implementation is split into focused C modules:
 
-- Custom memory arena allocator
-- Xorshift-style pseudo-random number generator
-- Matrix operations and batched matrix multiplication
-- Small neural-network autograd engine
-- Actor network with ReLU and softmax layers
-- Batched Snake environment and REINFORCE training loop
+- `arena.c` and `arena.h`: custom memory arena allocator
+- `random.c` and `random.h`: xorshift-style pseudo-random number generator
+- `environment.c` and `environment.h`: Snake grid and batched environment
+- `common.h`: shared types and configuration
+- `matrix.c` and `matrix.h`: matrix operations and linear algebra
+- `model.c` and `model.h`: neural-network autograd and policy model
+- `training.c` and `training.h`: REINFORCE rollout and training loop
+- `Snake.c`: program entry point
 
 The source trains in a 6x6 environment using batches of 64 independent trajectories.
 
@@ -26,7 +28,7 @@ The source trains in a 6x6 environment using batches of 64 independent trajector
 Run the following command in the project directory:
 
 ```powershell
-gcc -std=c11 -Wall -Wextra -O2 Snake.c -lm -o Snake.exe
+gcc -std=c11 -Wall -Wextra -O2 Snake.c arena.c random.c environment.c matrix.c model.c training.c -lm -o Snake.exe
 ```
 
 With GCC or MinGW installed under a different command name, replace `gcc` with that compiler executable.
@@ -57,13 +59,26 @@ The current training loop uses:
 | Learning rate | 0.05 |
 | Epochs | 2000 |
 
-These values are defined near the batching and training sections in `Snake.c` and can be changed to experiment with training behavior.
+Batch size and episode length are defined in `common.h`; the remaining training settings are in `training.c`.
 
 ## Project Structure
 
 ```text
 .
-|-- Snake.c       Main implementation and training entry point
+|-- Snake.c       Program entry point
+|-- arena.c       Memory arena implementation
+|-- arena.h       Memory arena interface
+|-- common.h      Shared types and configuration
+|-- environment.c Snake environment implementation
+|-- environment.h Snake environment interface
+|-- random.c      Pseudo-random number generator implementation
+|-- random.h      Pseudo-random number generator interface
+|-- matrix.c      Matrix operations implementation
+|-- matrix.h      Matrix operations interface
+|-- model.c       Neural-network and autograd implementation
+|-- model.h       Neural-network and autograd interface
+|-- training.c    REINFORCE training implementation
+|-- training.h    Training interface
 |-- README.md     Project documentation
 ```
 
