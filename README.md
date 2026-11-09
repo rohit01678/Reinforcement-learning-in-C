@@ -31,12 +31,12 @@ Run the following command in the project directory:
 gcc -std=c11 -Wall -Wextra -O2 Snake.c arena.c random.c environment.c matrix.c model.c training.c -lm -o Snake.exe
 ```
 
-With GCC or MinGW installed under a different command name, replace `gcc` with that compiler executable.
+The arena aligns memory using a pointer-width integer, so this build avoids pointer-size conversion warnings on both 32-bit and 64-bit Windows. With GCC or MinGW installed under a different command name, replace `gcc` with that compiler executable.
 
 ## Run
 
 ```powershell
-./Snake.exe
+.\Snake.exe
 ```
 
 The program prints training progress after each epoch, including:

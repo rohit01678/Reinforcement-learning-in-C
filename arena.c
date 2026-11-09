@@ -13,7 +13,7 @@ mem_arena* arena_create(u64 capacity) {
         return NULL;
     }
 
-    arena->memory = (u8*)ALIGN_UP_POW2((u64)(uintptr_t)arena->raw, ARENA_ALIGN);
+    arena->memory = (u8*)ALIGN_UP_POW2((uintptr_t)arena->raw, (uintptr_t)ARENA_ALIGN);
     arena->capacity = capacity;
     arena->pos = 0;
     return arena;
