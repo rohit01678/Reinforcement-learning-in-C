@@ -216,21 +216,21 @@ void backward_pass(Graph* graph) {
 // POLICY MODEL CREATION
 // ============================================================================
 void create_actor_model(mem_arena* arena, model_state* model, u32 batch) {
-    Var* input = var_create(arena, model, 76, batch, VAR_FLAG_NONE);
+    Var* input = var_create(arena, model, OBSERVATION_SIZE, batch, VAR_FLAG_NONE);
     model->input = input;
 
-    Var* W0 = var_create(arena, model, 128, 76, VAR_FLAG_PARAMETER | VAR_FLAG_REQUIRES_GRAD);
-    Var* b0 = var_create(arena, model, 128, 1, VAR_FLAG_PARAMETER | VAR_FLAG_REQUIRES_GRAD);
+    Var* W0 = var_create(arena, model, HIDDEN_SIZE, OBSERVATION_SIZE, VAR_FLAG_PARAMETER | VAR_FLAG_REQUIRES_GRAD);
+    Var* b0 = var_create(arena, model, HIDDEN_SIZE, 1, VAR_FLAG_PARAMETER | VAR_FLAG_REQUIRES_GRAD);
 
-    Var* W1 = var_create(arena, model, 128, 128, VAR_FLAG_PARAMETER | VAR_FLAG_REQUIRES_GRAD);
-    Var* b1 = var_create(arena, model, 128, 1, VAR_FLAG_PARAMETER | VAR_FLAG_REQUIRES_GRAD);
+    Var* W1 = var_create(arena, model, HIDDEN_SIZE, HIDDEN_SIZE, VAR_FLAG_PARAMETER | VAR_FLAG_REQUIRES_GRAD);
+    Var* b1 = var_create(arena, model, HIDDEN_SIZE, 1, VAR_FLAG_PARAMETER | VAR_FLAG_REQUIRES_GRAD);
 
-    Var* W2 = var_create(arena, model, 5, 128, VAR_FLAG_PARAMETER | VAR_FLAG_REQUIRES_GRAD);
+    Var* W2 = var_create(arena, model, 5, HIDDEN_SIZE, VAR_FLAG_PARAMETER | VAR_FLAG_REQUIRES_GRAD);
     Var* b2 = var_create(arena, model, 5, 1, VAR_FLAG_PARAMETER | VAR_FLAG_REQUIRES_GRAD);
 
-    f32 bound0 = sqrtf(6.0f / (76 + 128));
-    f32 bound1 = sqrtf(6.0f / (128 + 128));
-    f32 bound2 = sqrtf(6.0f / (128 + 5));
+    f32 bound0 = sqrtf(6.0f / (OBSERVATION_SIZE + HIDDEN_SIZE));
+    f32 bound1 = sqrtf(6.0f / (HIDDEN_SIZE + HIDDEN_SIZE));
+    f32 bound2 = sqrtf(6.0f / (HIDDEN_SIZE + 5));
 
     fill_rand(W0->val, -bound0, bound0);
     fill_rand(W1->val, -bound1, bound1);
