@@ -4,6 +4,6 @@
 #include "environment.h"
 #include "model.h"
 
-void train(model_state* model, SnakeENV* env, mem_arena* arena);
+void train(model_state* model, SnakeENV* env, mem_arena* arena, u32 epochs);
 
 #endif
