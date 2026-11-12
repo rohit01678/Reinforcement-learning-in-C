@@ -33,8 +33,14 @@ typedef struct {
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define ALIGN_UP_POW2(x, align) (((x) + (align) - 1) & ~((align) - 1))
 
-#define BATCH 64
+#define BATCH 32
 #define BUFFER_SIZE BATCH
-#define EPISODE_LEN 100
+#define EPISODE_LEN 60
+#define GRID_SIDE 16
+#define GRID_SIZE (GRID_SIDE * GRID_SIDE)
+#define MAX_SNAKE_LENGTH GRID_SIZE
+#define OBSERVATION_SIZE (GRID_SIZE + 10)
+#define HIDDEN_SIZE 64
+#define DEFAULT_TRAINING_EPOCHS 25
 
 #endif
