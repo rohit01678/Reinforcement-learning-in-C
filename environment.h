@@ -12,6 +12,8 @@ typedef struct {
 
 typedef struct {
     State snake[BATCH];
+    State body[BATCH][MAX_SNAKE_LENGTH];
+    u32 body_len[BATCH];
     State food[BATCH];
     ACTION pov[BATCH];
     b32 active[BATCH];
@@ -23,7 +25,8 @@ State get_random_food_loc(u32 cols, u32 rows);
 b32 state_out_of_bounds(State state, u32 cols, u32 rows);
 void reset_batch_env(BatchEnv* batch_env, const SnakeENV* env);
 f32 step_batch_env(BatchEnv* batch_env, u32 index, const SnakeENV* env, ACTION action);
-void build_state_vector_col(matrix* input, u32 col, State state, State food_state, ACTION pov, u32 cols, u32 grid_size);
-ACTION sample_action_col(const matrix* probs, u32 col);
+void build_state_vector_col(matrix* input, u32 col, State state, State food_state, const State* body, u32 body_len, ACTION pov, u32 cols, u32 grid_size);
+ACTION sample_action_col(const matrix* probs, u32 col, ACTION pov, State head, State food, State tail, const State* body, u32 body_len, u32 cols, u32 rows);
+ACTION best_action_col(const matrix* probs, u32 col, ACTION pov, State head, State food, State tail, const State* body, u32 body_len, u32 cols, u32 rows);
 
 #endif
