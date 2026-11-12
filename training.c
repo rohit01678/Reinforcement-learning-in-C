@@ -3,12 +3,15 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 // REINFORCE TRAINING LOOP
 // ============================================================================
 typedef struct {
     State states[EPISODE_LEN];
     State food_states[EPISODE_LEN];
+    State bodies[EPISODE_LEN][MAX_SNAKE_LENGTH];
+    u32 body_lens[EPISODE_LEN];
     ACTION povs[EPISODE_LEN];
     ACTION actions[EPISODE_LEN];
     f32 rewards[EPISODE_LEN];
@@ -23,9 +26,8 @@ typedef struct {
     u32 count;
 } ReplayBuffer;
 
-void train(model_state* model, SnakeENV* env, mem_arena* arena) {
+void train(model_state* model, SnakeENV* env, mem_arena* arena, u32 epochs) {
     (void)arena;
-    u32 EPOCHS = 2000;
     u32 episode_len = EPISODE_LEN;
     f32 gamma = 0.99f;
     f32 learning_rate = 0.05f;
@@ -44,18 +46,20 @@ void train(model_state* model, SnakeENV* env, mem_arena* arena) {
     u32 max_samples = BUFFER_SIZE * episode_len;
     State* flat_state = malloc(sizeof(State) * max_samples);
     State* flat_food = malloc(sizeof(State) * max_samples);
+    State* flat_body = malloc(sizeof(State) * max_samples * MAX_SNAKE_LENGTH);
+    u32* flat_body_len = malloc(sizeof(u32) * max_samples);
     ACTION* flat_pov = malloc(sizeof(ACTION) * max_samples);
     ACTION* flat_action = malloc(sizeof(ACTION) * max_samples);
     f32* flat_advantage = malloc(sizeof(f32) * max_samples);
 
-    if (!flat_state || !flat_food || !flat_pov || !flat_action || !flat_advantage) {
+    if (!flat_state || !flat_food || !flat_body || !flat_body_len || !flat_pov || !flat_action || !flat_advantage) {
         fprintf(stderr, "Failed to allocate flattened sample buffers!\n");
         free(buffer); free(benv);
-        free(flat_state); free(flat_food); free(flat_pov); free(flat_action); free(flat_advantage);
+        free(flat_state); free(flat_food); free(flat_body); free(flat_body_len); free(flat_pov); free(flat_action); free(flat_advantage);
         return;
     }
 
-    for (u32 epoch = 0; epoch < EPOCHS; epoch++) {
+    for (u32 epoch = 0; epoch < epochs; epoch++) {
         // ------------------------------------------------------------
         // ROLLOUT: step all BATCH trajectories together at each
         // timestep, doing exactly one forward pass per timestep
@@ -70,7 +74,7 @@ void train(model_state* model, SnakeENV* env, mem_arena* arena) {
             for (u32 i = 0; i < BATCH; i++) {
                 if (!benv->active[i]) continue;
                 any_active = true;
-                build_state_vector_col(model->input->val, i, benv->snake[i], benv->food[i], benv->pov[i], env->cols, env->grid_size);
+                build_state_vector_col(model->input->val, i, benv->snake[i], benv->food[i], benv->body[i], benv->body_len[i], benv->pov[i], env->cols, env->grid_size);
             }
             if (!any_active) break;
 
@@ -83,14 +87,18 @@ void train(model_state* model, SnakeENV* env, mem_arena* arena) {
                 State state = benv->snake[i];
                 State food_state = benv->food[i];
                 ACTION pov = benv->pov[i];
-
-                ACTION action = sample_action_col(model->output->val, i);
-                f32 reward = step_batch_env(benv, i, env, action);
-                b32 done = state_out_of_bounds(benv->snake[i], env->cols, env->rows);
-
+                u32 body_len = benv->body_len[i];
                 traj->states[t] = state;
                 traj->food_states[t] = food_state;
+                traj->body_lens[t] = body_len;
+                memcpy(traj->bodies[t], benv->body[i], sizeof(State) * body_len);
                 traj->povs[t] = pov;
+
+                State tail = benv->body[i][body_len - 1];
+                ACTION action = sample_action_col(model->output->val, i, pov, state, food_state, tail, benv->body[i], body_len, env->cols, env->rows);
+                f32 reward = step_batch_env(benv, i, env, action);
+                b32 done = !benv->active[i];
+
                 traj->actions[t] = action;
                 traj->rewards[t] = reward;
                 traj->next_states[t] = benv->snake[i];
@@ -138,6 +146,8 @@ void train(model_state* model, SnakeENV* env, mem_arena* arena) {
             for (u32 t = 0; t < traj->len; t++) {
                 flat_state[idx] = traj->states[t];
                 flat_food[idx] = traj->food_states[t];
+                flat_body_len[idx] = traj->body_lens[t];
+                memcpy(flat_body + (u64)idx * MAX_SNAKE_LENGTH, traj->bodies[t], sizeof(State) * traj->body_lens[t]);
                 flat_pov[idx] = traj->povs[t];
                 flat_action[idx] = traj->actions[t];
                 flat_advantage[idx] = (traj->returns[t] - return_mean) / (return_std + 1e-8f);
@@ -166,7 +176,7 @@ void train(model_state* model, SnakeENV* env, mem_arena* arena) {
             clear(model->advantage->val);
             for (u32 c = 0; c < n; c++) {
                 u32 s = start + c;
-                build_state_vector_col(model->input->val, c, flat_state[s], flat_food[s], flat_pov[s], env->cols, env->grid_size);
+                build_state_vector_col(model->input->val, c, flat_state[s], flat_food[s], flat_body + (u64)s * MAX_SNAKE_LENGTH, flat_body_len[s], flat_pov[s], env->cols, env->grid_size);
                 model->advantage->val->data[c + (u64)flat_action[s] * model->advantage->val->cols] = flat_advantage[s];
             }
 
@@ -189,7 +199,7 @@ void train(model_state* model, SnakeENV* env, mem_arena* arena) {
         fflush(stdout);
     }
 
-    free(flat_state); free(flat_food); free(flat_pov); free(flat_action); free(flat_advantage);
+    free(flat_state); free(flat_food); free(flat_body); free(flat_body_len); free(flat_pov); free(flat_action); free(flat_advantage);
     free(benv);
     free(buffer);
 }
