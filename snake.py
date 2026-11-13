@@ -48,6 +48,7 @@ class SnakeWorld:
 		self.steps = 0
 		self.game_over = False
 		self.won = False
+		self.last_reward = 0.0
 		self.food = self._new_food()
 
 	def _new_food(self):
@@ -62,15 +63,20 @@ class SnakeWorld:
 
 		dx, dy = VECTORS[action]
 		head = (self.snake[0][0] + dx, self.snake[0][1] + dy)
+		old_distance = abs(self.food[0] - self.snake[0][0]) + abs(self.food[1] - self.snake[0][1])
+		new_distance = abs(self.food[0] - head[0]) + abs(self.food[1] - head[1])
+		reward = 0.1 * (old_distance - new_distance) - 0.01
 		eating = head == self.food
 		collision_body = self.snake if eating else self.snake[:-1]
 		if not (0 <= head[0] < GRID and 0 <= head[1] < GRID) or head in collision_body:
 			self.game_over = True
+			self.last_reward = reward - 10.0
 			return False
 
 		self.direction = action
 		self.snake.insert(0, head)
 		if eating:
+			reward += 20.0
 			self.score += 1
 			self.best = max(self.best, self.score)
 			self.food = self._new_food()
@@ -80,6 +86,7 @@ class SnakeWorld:
 		else:
 			self.snake.pop()
 		self.steps += 1
+		self.last_reward = reward
 		return True
 
 	def observation(self):
@@ -115,6 +122,7 @@ class AgentBridge:
 		self.events = queue.Queue()
 		self.process = None
 		self.thread = None
+		self.has_pending_action = False
 
 	def start(self):
 		self.thread = threading.Thread(target=self._run, daemon=True)
@@ -133,7 +141,7 @@ class AgentBridge:
 				if compiler is None:
 					self.events.put(("error", "gcc was not found on PATH."))
 					return
-				command = [compiler, "-std=c11", "-Wall", "-Wextra", "-O3", *self.SOURCES, "-lm", "-o", str(executable)]
+				command = [compiler, "-std=c11", "-Wall", "-Wextra", "-O3", "-march=native", "-funroll-loops", "-ffast-math", *self.SOURCES, "-lm", "-o", str(executable)]
 				flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 				result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, creationflags=flags)
 				if result.returncode != 0:
@@ -182,6 +190,11 @@ class AgentBridge:
 						self.events.put(("action", int(line.split()[1])))
 					except (IndexError, ValueError):
 						self.events.put(("error", "The C agent returned an invalid action."))
+				elif line.startswith("LEARNED "):
+					try:
+						self.events.put(("learned", int(line.split()[1])))
+					except (IndexError, ValueError):
+						self.events.put(("error", "The C agent returned an invalid learning update."))
 				elif line.startswith("ERROR "):
 					self.events.put(("error", line[6:]))
 		except OSError as error:
@@ -191,14 +204,57 @@ class AgentBridge:
 		if self.process is None or self.process.poll() is not None:
 			return False
 		try:
-			self.process.stdin.write(" ".join(f"{value:.8g}" for value in observation) + "\n")
+			self.process.stdin.write("STEP " + " ".join(f"{value:.8g}" for value in observation) + "\n")
+			self.process.stdin.flush()
+			self.has_pending_action = True
+			return True
+		except (BrokenPipeError, OSError):
+			return False
+
+	def feedback(self, reward, done):
+		if self.process is None or self.process.poll() is not None or not self.has_pending_action:
+			return False
+		try:
+			self.process.stdin.write(f"FEEDBACK {reward:.8g} {int(done)}\n")
+			self.process.stdin.flush()
+			self.has_pending_action = False
+			return True
+		except (BrokenPipeError, OSError):
+			return False
+
+	def end_episode(self):
+		if self.process is None or self.process.poll() is not None or self.has_pending_action:
+			return False
+		try:
+			self.process.stdin.write("END\n")
 			self.process.stdin.flush()
 			return True
 		except (BrokenPipeError, OSError):
 			return False
 
+	def abort_episode(self):
+		if self.process is None or self.process.poll() is not None:
+			return False
+		try:
+			self.process.stdin.write("ABORT\n")
+			self.process.stdin.flush()
+			self.has_pending_action = False
+			return True
+		except (BrokenPipeError, OSError):
+			return False
+
 	def stop(self):
-		if self.process is not None and self.process.poll() is None:
+		if self.process is None or self.process.poll() is not None:
+			return
+		if self.has_pending_action:
+			self.abort_episode()
+		else:
+			self.end_episode()
+		if self.process.stdin is not None:
+			self.process.stdin.close()
+		try:
+			self.process.wait(timeout=5)
+		except subprocess.TimeoutExpired:
 			self.process.terminate()
 			try:
 				self.process.wait(timeout=2)
@@ -222,7 +278,7 @@ def draw_button(surface, rect, label, active, typeface):
 	surface.blit(label_surface, label_surface.get_rect(center=rect.center))
 
 
-def draw_game(screen, world, mode, paused, bridge_state, progress, error, speed):
+def draw_game(screen, world, mode, paused, bridge_state, progress, error, speed, speed_text, speed_input_active, speed_input_error, policy_updates):
 	screen.fill(BG)
 	small = font(13, True)
 	label = font(15, True)
@@ -281,15 +337,18 @@ def draw_game(screen, world, mode, paused, bridge_state, progress, error, speed)
 	panel_width = WINDOW_WIDTH - panel_x - 42
 	pygame.draw.rect(screen, PANEL, (panel_x, BOARD_Y, panel_width, 150), border_radius=10)
 	draw_text(screen, small, "PLAY MODE", (panel_x + 20, BOARD_Y + 18), MUTED)
-	human_rect = pygame.Rect(panel_x + 20, BOARD_Y + 48, 150, 42)
-	ai_rect = pygame.Rect(panel_x + 180, BOARD_Y + 48, 190, 42)
+	human_rect = pygame.Rect(panel_x + 20, BOARD_Y + 48, 120, 42)
+	ai_rect = pygame.Rect(panel_x + 148, BOARD_Y + 48, 130, 42)
+	retrain_rect = pygame.Rect(panel_x + 286, BOARD_Y + 48, 170, 42)
 	draw_button(screen, human_rect, "HUMAN", mode == "human", label)
 	draw_button(screen, ai_rect, "C POLICY", mode == "ai", label)
+	draw_button(screen, retrain_rect, "AUTO TRAIN", bridge_state == "training", label)
 	status_y = BOARD_Y + 106
 	if error:
 		draw_text(screen, small, "AGENT ERROR", (panel_x + 20, status_y), CORAL)
 	elif bridge_state == "ready":
-		draw_text(screen, small, "POLICY ONLINE", (panel_x + 20, status_y), CYAN)
+		status = f"POLICY UPDATED x{policy_updates}" if policy_updates else "POLICY ONLINE"
+		draw_text(screen, small, status, (panel_x + 20, status_y), CYAN)
 	elif bridge_state == "training":
 		percentage = int(100 * progress[0] / max(progress[1], 1))
 		draw_text(screen, small, f"TRAINING C POLICY  {percentage}%", (panel_x + 20, status_y), CYAN)
@@ -315,11 +374,25 @@ def draw_game(screen, world, mode, paused, bridge_state, progress, error, speed)
 	draw_text(screen, small, "CONTROLS", (panel_x + 20, BOARD_Y + 352), MUTED)
 	draw_text(screen, body, "ARROWS / WASD  Move", (panel_x + 20, BOARD_Y + 380), TEXT)
 	draw_text(screen, body, "SPACE  Pause     R  Restart", (panel_x + 20, BOARD_Y + 408), TEXT)
-	draw_text(screen, small, f"STEP RATE  {speed:.1f} / SEC", (panel_x + 20, BOARD_Y + 478), CYAN)
-	draw_text(screen, small, "[ - ] SLOWER        [ + ] FASTER", (panel_x + 20, BOARD_Y + 502), MUTED)
+	draw_text(screen, small, "STEPS / SEC", (panel_x + 20, BOARD_Y + 478), CYAN)
+	speed_input_rect = pygame.Rect(panel_x + 150, BOARD_Y + 466, 76, 30)
+	pygame.draw.rect(screen, PANEL_ALT, speed_input_rect, border_radius=6)
+	pygame.draw.rect(screen, CYAN if speed_input_active else GRID_LINE, speed_input_rect, 2, border_radius=6)
+	input_text = speed_text if speed_input_active else str(int(speed))
+	if speed_input_active:
+		input_text += "|"
+	input_surface = small.render(input_text, True, TEXT)
+	screen.blit(input_surface, input_surface.get_rect(center=speed_input_rect.center))
+	if speed_input_error:
+		speed_hint = "Enter a value from 2 to 45"
+	elif speed_input_active:
+		speed_hint = "Type 2-45; Enter applies"
+	else:
+		speed_hint = "Click to set; [ - ] / [ + ] adjust"
+	draw_text(screen, small, speed_hint, (panel_x + 20, BOARD_Y + 502), CORAL if speed_input_error else MUTED)
 
 	pygame.display.flip()
-	return human_rect, ai_rect
+	return human_rect, ai_rect, retrain_rect, speed_input_rect
 
 
 def main():
@@ -346,21 +419,41 @@ def main():
 	awaiting_action = False
 	discard_action = False
 	speed = 45.0
+	speed_text = str(int(speed))
+	speed_input_active = False
+	speed_input_error = False
+	policy_updates = 0
 	next_step = time.monotonic() + 1.0 / speed
 	human_button = pygame.Rect(0, 0, 0, 0)
 	ai_button = pygame.Rect(0, 0, 0, 0)
+	retrain_button = pygame.Rect(0, 0, 0, 0)
+	speed_input_rect = pygame.Rect(0, 0, 0, 0)
 	running = True
 
-	def choose_mode(new_mode):
-		nonlocal mode, bridge, bridge_state, error, awaiting_action, discard_action
+	def choose_mode(new_mode, force_retrain=False):
+		nonlocal mode, bridge, bridge_state, error, awaiting_action, discard_action, progress, policy_updates
+		error = ""
+		if new_mode == "ai" and force_retrain:
+			if bridge is not None:
+				bridge.stop()
+				bridge = None
+			bridge_state = "idle"
+			awaiting_action = False
+			discard_action = False
+			progress = (0, args.epochs)
+			policy_updates = 0
 		if new_mode == "ai" and bridge is None:
-			bridge = AgentBridge(args.epochs, args.retrain)
+			bridge = AgentBridge(args.epochs, force_retrain or args.retrain)
 			bridge_state = "training"
 			bridge.start()
+		if new_mode != mode and mode == "ai" and bridge is not None and bridge_state == "ready":
+			if awaiting_action:
+				if not bridge.abort_episode():
+					error = "Could not discard the pending C policy action."
+				discard_action = True
+			elif not bridge.end_episode():
+				error = "Could not send episode feedback to the C agent."
 		mode = new_mode
-		error = ""
-		if awaiting_action:
-			discard_action = True
 
 	if args.ai:
 		choose_mode("ai")
@@ -371,17 +464,54 @@ def main():
 			if event.type == pygame.QUIT:
 				running = False
 			elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+				if speed_input_rect.collidepoint(event.pos):
+					speed_input_active = True
+					speed_text = ""
+					speed_input_error = False
+				else:
+					speed_input_active = False
+					speed_input_error = False
+					speed_text = str(int(speed))
 				if human_button.collidepoint(event.pos):
 					choose_mode("human")
 				elif ai_button.collidepoint(event.pos):
 					choose_mode("ai")
+				elif retrain_button.collidepoint(event.pos):
+					choose_mode("ai", force_retrain=True)
 			elif event.type == pygame.KEYDOWN:
-				if event.key == pygame.K_ESCAPE:
+				if speed_input_active:
+					if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+						if speed_text.isdigit() and 2 <= int(speed_text) <= 45:
+							speed = float(int(speed_text))
+							next_step = now + 1.0 / speed
+							speed_input_active = False
+							speed_input_error = False
+						else:
+							speed_input_error = True
+					elif event.key == pygame.K_ESCAPE:
+						speed_input_active = False
+						speed_input_error = False
+						speed_text = str(int(speed))
+					elif event.key == pygame.K_BACKSPACE:
+						speed_text = speed_text[:-1]
+						speed_input_error = False
+					elif event.unicode in "0123456789" and len(speed_text) < 2:
+						speed_text += event.unicode
+						speed_input_error = False
+					continue
+				elif event.key == pygame.K_ESCAPE:
 					running = False
 				elif event.key == pygame.K_SPACE:
 					paused = not paused
 					next_step = now + 1.0 / speed
 				elif event.key == pygame.K_r:
+					if mode == "ai" and bridge is not None and bridge_state == "ready" and not world.game_over:
+						if awaiting_action:
+							if not bridge.abort_episode():
+								error = "Could not discard the pending C policy action."
+							discard_action = True
+						elif not bridge.end_episode():
+							error = "Could not send episode feedback to the C agent."
 					world.reset()
 					awaiting_action = awaiting_action or discard_action
 					discard_action = awaiting_action
@@ -418,13 +548,21 @@ def main():
 					next_step = now
 				elif kind == "progress":
 					progress = data
+				elif kind == "learned":
+					policy_updates += 1
 				elif kind == "action":
 					awaiting_action = False
 					if discard_action:
 						discard_action = False
 					elif mode == "ai" and not paused and not world.game_over:
 						world.step(data)
-					next_step = now + 1.0 / speed
+						if not bridge.feedback(world.last_reward, world.game_over):
+							error = "Could not send episode feedback to the C agent."
+							bridge_state = "error"
+					else:
+						if not bridge.abort_episode():
+							error = "Could not discard the pending C policy action."
+							bridge_state = "error"
 				elif kind == "error":
 					error = data
 					bridge_state = "error"
@@ -436,11 +574,15 @@ def main():
 				next_step = now + 1.0 / speed
 			elif mode == "ai" and bridge_state == "ready" and not awaiting_action and now >= next_step:
 				awaiting_action = bridge.send(world.observation())
+				next_step = now + 1.0 / speed
 				if not awaiting_action:
 					error = "Could not send state to the C agent."
 					bridge_state = "error"
 
-		human_button, ai_button = draw_game(screen, world, mode, paused, bridge_state, progress, error, speed)
+		human_button, ai_button, retrain_button, speed_input_rect = draw_game(
+			screen, world, mode, paused, bridge_state, progress, error,
+			speed, speed_text, speed_input_active, speed_input_error, policy_updates,
+		)
 		clock.tick(60)
 
 	if bridge is not None:
