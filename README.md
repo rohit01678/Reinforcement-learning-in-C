@@ -31,15 +31,15 @@ The source trains in a 16x16 environment using batches of 32 independent traject
 Run the following command in the project directory:
 
 ```powershell
-gcc -std=c11 -Wall -Wextra -O3 Snake.c arena.c random.c environment.c matrix.c model.c training.c -lm -o Snake.exe
+gcc -std=c11 -Wall -Wextra -O3 -march=native -funroll-loops -ffast-math Snake.c arena.c random.c environment.c matrix.c model.c training.c -lm -o Snake.exe
 ```
 
-The arena aligns memory using a pointer-width integer, so this build avoids pointer-size conversion warnings on both 32-bit and 64-bit Windows. With GCC or MinGW installed under a different command name, replace `gcc` with that compiler executable.
+The arena aligns memory using a pointer-width integer, so this build avoids pointer-size conversion warnings on both 32-bit and 64-bit Windows. With GCC or MinGW installed under a different command name, replace `gcc` with that compiler executable. The added vectorization flags target the local machine's CPU and help the training loop and matrix math run faster.
 
 On Linux, use the same source list and name the output `Snake`:
 
 ```sh
-gcc -std=c11 -Wall -Wextra -O3 Snake.c arena.c random.c environment.c matrix.c model.c training.c -lm -o Snake
+gcc -std=c11 -Wall -Wextra -O3 -march=native -funroll-loops -ffast-math Snake.c arena.c random.c environment.c matrix.c model.c training.c -lm -o Snake
 ```
 
 ## Docker
@@ -64,6 +64,14 @@ On Linux with X11:
 docker run --rm -v snake-policy:/data -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix snake-rl
 ```
 
+To retrain from scratch at container startup instead of loading the saved policy, append `--retrain` to either `docker run` command. For example:
+
+```powershell
+docker run --rm -v snake-policy:/data -e DISPLAY=host.docker.internal:0.0 snake-rl --retrain
+```
+
+This replaces `/data/Snake-policy.bin` in the mounted volume. You can also start the normal AI game and use **AUTO TRAIN** to retrain from the game window.
+
 To run only C training without a display:
 
 ```sh
@@ -76,20 +84,21 @@ docker run --rm -v snake-policy:/data --entrypoint ./Snake snake-rl
 .\Snake.exe
 ```
 
-To play the graphical game, create and activate a Python environment, install Pygame, and launch the game:
+To play the graphical game, create a Python environment, install Pygame, and launch it with that environment's Python:
 
 ```powershell
 py -3.13 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install pygame
-python snake.py
+.\.venv\Scripts\python.exe -m pip install pygame
+.\.venv\Scripts\python.exe snake.py
 ```
 
 To launch the AI game without a console window, double-click `run_snake.vbs`.
 
-The game opens in human mode. Choose **C POLICY** to train or load the C policy and watch it play. Locally, weights are saved to `Snake-policy.bin`. In Docker, `SNAKE_POLICY_PATH` points to `/data/Snake-policy.bin`; use the documented `snake-policy` volume to keep weights across container runs. Use `python snake.py --ai --retrain` to force training again, or pass an epoch count such as `python snake.py --ai --retrain --epochs 50`.
+The game opens in human mode. Choose **C POLICY** to load the saved policy (or train if none exists) and watch it play. Choose **AUTO TRAIN** to retrain a fresh policy and then start AI play. Locally, weights are saved to `Snake-policy.bin`. In Docker, `SNAKE_POLICY_PATH` points to `/data/Snake-policy.bin`; use the documented `snake-policy` volume to keep trained weights across container runs. Use `.\.venv\Scripts\python.exe snake.py --ai --retrain` to force training from the command line, or pass an epoch count such as `.\.venv\Scripts\python.exe snake.py --ai --retrain --epochs 50`.
 
-Use the arrow keys or WASD to steer, Space to pause, R to restart, and + or - to adjust the speed. The game runs at 45 steps per second by default.
+Use the arrow keys or WASD to steer, Space to pause, and R to restart. Click the steps-per-second field, type a value from 2 to 45, and press Enter to apply it; + or - still adjusts the speed. The game runs at 45 steps per second by default.
+
+In C POLICY mode, each completed run provides reward feedback to the agent: collecting food and moving toward food are rewarded, while crashing is penalized. At the end of a run, the agent applies an online REINFORCE update and saves the revised policy to the checkpoint. The game indicates when the policy has been updated.
 
 ## Developer Notes
 
