@@ -127,81 +127,86 @@ static b32 action_is_valid(ACTION action, ACTION pov) {
              (pov == UP && action == DOWN) || (pov == DOWN && action == UP));
 }
 
-static b32 same_state(State a, State b) {
-    return a.x == b.x && a.y == b.y;
+static inline void advance_state(State head, ACTION action, State* next) {
+    next->x = head.x;
+    next->y = head.y;
+    if (action == LEFT) next->x--;
+    else if (action == RIGHT) next->x++;
+    else if (action == UP) next->y++;
+    else if (action == DOWN) next->y--;
 }
 
-static b32 action_is_safe(ACTION action, ACTION pov, State head, State food, State tail, const State* body, u32 body_len, u32 cols, u32 rows) {
-    if (!action_is_valid(action, pov)) return false;
-    State next = head;
-    if (action == LEFT) next.x--;
-    else if (action == RIGHT) next.x++;
-    else if (action == UP) next.y++;
-    else if (action == DOWN) next.y--;
-    if (state_out_of_bounds(next, cols, rows)) return false;
-    b32 growing = same_state(next, food);
-    for (u32 segment = 0; segment < body_len; segment++) {
-        if (!growing && same_state(body[segment], tail)) continue;
-        if (body[segment].x == next.x && body[segment].y == next.y) return false;
-    }
-    return true;
-}
-
-static u32 reachable_metrics(State start, State food, State tail, const State* body, u32 body_len, b32 growing, u32 cols, u32 rows, u32* food_distance) {
-    b32 blocked[GRID_SIZE] = { 0 };
+static u32 reachable_metrics(State start, State food, const b32* blocked, u32 tail_cell, b32 growing, u32 cols, u32 rows, u32* food_distance) {
     b32 visited[GRID_SIZE] = { 0 };
-    u32 distances[GRID_SIZE];
     u32 queue[GRID_SIZE];
-    for (u32 cell = 0; cell < GRID_SIZE; cell++) distances[cell] = GRID_SIZE + 1;
-
-    for (u32 segment = 0; segment < body_len; segment++) {
-        if (!growing && same_state(body[segment], tail)) continue;
-        u32 cell = (u32)body[segment].y * cols + (u32)body[segment].x;
-        blocked[cell] = true;
-    }
 
     u32 start_cell = (u32)start.y * cols + (u32)start.x;
     u32 food_cell = (u32)food.y * cols + (u32)food.x;
     u32 read_index = 0, write_index = 0, area = 1;
+    u32 depth = 0;
+    *food_distance = start_cell == food_cell ? 0 : GRID_SIZE + 1;
     queue[write_index++] = start_cell;
     visited[start_cell] = true;
-    distances[start_cell] = 0;
 
     static const i32 dx[4] = { -1, 1, 0, 0 };
     static const i32 dy[4] = { 0, 0, 1, -1 };
     while (read_index < write_index) {
-        u32 cell = queue[read_index++];
-        i32 x = (i32)(cell % cols);
-        i32 y = (i32)(cell / cols);
-        for (u32 direction = 0; direction < 4; direction++) {
-            State next = { .x = x + dx[direction], .y = y + dy[direction] };
-            if (state_out_of_bounds(next, cols, rows)) continue;
-            u32 next_cell = (u32)next.y * cols + (u32)next.x;
-            if (blocked[next_cell] || visited[next_cell]) continue;
-            visited[next_cell] = true;
-            distances[next_cell] = distances[cell] + 1;
-            queue[write_index++] = next_cell;
-            area++;
+        u32 layer_end = write_index;
+        while (read_index < layer_end) {
+            u32 cell = queue[read_index++];
+            i32 x = (i32)(cell % cols);
+            i32 y = (i32)(cell / cols);
+            for (u32 direction = 0; direction < 4; direction++) {
+                State next = { .x = x + dx[direction], .y = y + dy[direction] };
+                if (state_out_of_bounds(next, cols, rows)) continue;
+                u32 next_cell = (u32)next.y * cols + (u32)next.x;
+                if ((blocked[next_cell] && (growing || next_cell != tail_cell)) || visited[next_cell]) continue;
+                visited[next_cell] = true;
+                queue[write_index++] = next_cell;
+                area++;
+                if (next_cell == food_cell && *food_distance > GRID_SIZE) *food_distance = depth + 1;
+            }
         }
+        depth++;
     }
 
-    *food_distance = distances[food_cell];
     return area;
 }
 
 ACTION sample_action_col(const matrix* probs, u32 col, ACTION pov, State head, State food, State tail, const State* body, u32 body_len, u32 cols, u32 rows) {
     f32 total = 0.0f;
-    for (u32 i = 0; i < 4; i++) {
-        if (action_is_safe((ACTION)i, pov, head, food, tail, body, body_len, cols, rows)) total += probs->data[col + (u64)i * probs->cols];
+    ACTION last_valid = pov;
+    f32 valid_probs[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    b32 blocked[GRID_SIZE] = { 0 };
+    for (u32 segment = 0; segment < body_len; segment++) {
+        u32 cell = (u32)body[segment].y * cols + (u32)body[segment].x;
+        blocked[cell] = true;
     }
+    u32 tail_cell = (u32)tail.y * cols + (u32)tail.x;
+
+    for (u32 i = 0; i < 4; i++) {
+        if (!action_is_valid((ACTION)i, pov)) continue;
+
+        State next;
+        advance_state(head, (ACTION)i, &next);
+        if (state_out_of_bounds(next, cols, rows)) continue;
+
+        b32 growing = next.x == food.x && next.y == food.y;
+        u32 next_cell = (u32)next.y * cols + (u32)next.x;
+        if (blocked[next_cell] && (growing || next_cell != tail_cell)) continue;
+
+        valid_probs[i] = probs->data[col + (u64)i * probs->cols];
+        total += valid_probs[i];
+        last_valid = (ACTION)i;
+    }
+
     if (total <= 0.0f) return pov;
+
     f32 r = prng_randf() * total;
     f32 cdf = 0.0f;
-    ACTION last_valid = pov;
     for (u32 i = 0; i < 4; i++) {
-        if (!action_is_safe((ACTION)i, pov, head, food, tail, body, body_len, cols, rows)) continue;
-        last_valid = (ACTION)i;
-        cdf += probs->data[col + (u64)i * probs->cols];
+        if (valid_probs[i] <= 0.0f) continue;
+        cdf += valid_probs[i];
         if (r <= cdf) return (ACTION)i;
     }
     return last_valid;
@@ -210,17 +215,27 @@ ACTION sample_action_col(const matrix* probs, u32 col, ACTION pov, State head, S
 ACTION best_action_col(const matrix* probs, u32 col, ACTION pov, State head, State food, State tail, const State* body, u32 body_len, u32 cols, u32 rows) {
     ACTION best = pov;
     f32 best_score = -INFINITY;
+    b32 blocked[GRID_SIZE] = { 0 };
+    for (u32 segment = 0; segment < body_len; segment++) {
+        u32 cell = (u32)body[segment].y * cols + (u32)body[segment].x;
+        blocked[cell] = true;
+    }
+    u32 tail_cell = (u32)tail.y * cols + (u32)tail.x;
+
     for (u32 i = 0; i < 4; i++) {
-        if (!action_is_safe((ACTION)i, pov, head, food, tail, body, body_len, cols, rows)) continue;
-        f32 probability = probs->data[col + (u64)i * probs->cols];
-        State next = head;
-        if (i == LEFT) next.x--;
-        else if (i == RIGHT) next.x++;
-        else if (i == UP) next.y++;
-        else if (i == DOWN) next.y--;
-        u32 food_distance = GRID_SIZE + 1;
+        if (!action_is_valid((ACTION)i, pov)) continue;
+
+        State next;
+        advance_state(head, (ACTION)i, &next);
+        if (state_out_of_bounds(next, cols, rows)) continue;
+
         b32 growing = next.x == food.x && next.y == food.y;
-        u32 reachable = reachable_metrics(next, food, tail, body, body_len, growing, cols, rows, &food_distance);
+        u32 next_cell = (u32)next.y * cols + (u32)next.x;
+        if (blocked[next_cell] && (growing || next_cell != tail_cell)) continue;
+
+        f32 probability = probs->data[col + (u64)i * probs->cols];
+        u32 food_distance = GRID_SIZE + 1;
+        u32 reachable = reachable_metrics(next, food, blocked, tail_cell, growing, cols, rows, &food_distance);
         f32 space_score = 1.75f * logf((f32)reachable + 1.0f);
         f32 path_score = food_distance > GRID_SIZE ? -20.0f : -0.65f * (f32)food_distance;
         f32 score = probability + space_score + path_score;
