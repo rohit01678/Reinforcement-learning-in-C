@@ -1,4 +1,5 @@
 #define _CRT_SECURE_NO_WARNINGS
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -125,6 +126,77 @@ static b32 copy_policy_parameters(const model_state* source, model_state* destin
     return copied == graph_parameter_count(&destination->forward_graph);
 }
 
+typedef struct {
+    f32 observation[OBSERVATION_SIZE];
+    ACTION action;
+    f32 reward;
+} OnlineSample;
+
+static b32 append_online_sample(OnlineSample** samples, u32* count, u32* capacity, const f32* observation, ACTION action, f32 reward) {
+    if (*count == *capacity) {
+        u32 new_capacity = *capacity ? *capacity * 2 : 256;
+        if (new_capacity < *capacity || new_capacity == 0 ||
+            sizeof(**samples) > SIZE_MAX / (size_t)new_capacity) return false;
+        OnlineSample* new_samples = realloc(*samples, sizeof(**samples) * (size_t)new_capacity);
+        if (!new_samples) return false;
+        *samples = new_samples;
+        *capacity = new_capacity;
+    }
+
+    OnlineSample* sample = &(*samples)[(*count)++];
+    memcpy(sample->observation, observation, sizeof(sample->observation));
+    sample->action = action;
+    sample->reward = reward;
+    return true;
+}
+
+static b32 update_online_policy(model_state* model, const OnlineSample* samples, u32 sample_count, const char* checkpoint_path) {
+    if (sample_count == 0) return true;
+
+    f32* returns = malloc(sizeof(*returns) * sample_count);
+    if (!returns) return false;
+
+    f32 total_return = 0.0f;
+    f32 total_return_squared = 0.0f;
+    f32 discounted_return = 0.0f;
+    for (i64 i = (i64)sample_count - 1; i >= 0; i--) {
+        discounted_return = samples[i].reward + 0.99f * discounted_return;
+        returns[i] = discounted_return;
+        total_return += discounted_return;
+        total_return_squared += discounted_return * discounted_return;
+    }
+    f32 mean_return = total_return / (f32)sample_count;
+    f32 variance = total_return_squared / (f32)sample_count - mean_return * mean_return;
+    f32 std_return = sqrtf(MAX(variance, 0.0f));
+
+    for (u32 i = 0; i < model->cost_graph.size; i++) {
+        Var* var = model->cost_graph.vars[i];
+        if (var->flags & VAR_FLAG_PARAMETER) clear(var->grad);
+    }
+
+    for (u32 i = 0; i < sample_count; i++) {
+        memcpy(model->input->val->data, samples[i].observation, sizeof(samples[i].observation));
+        clear(model->advantage->val);
+        f32 advantage = std_return > 1e-6f ? (returns[i] - mean_return) / std_return : returns[i];
+        model->advantage->val->data[(u64)samples[i].action * model->advantage->val->cols] = advantage;
+        forward_pass(&model->cost_graph);
+        backward_pass(&model->cost_graph);
+    }
+
+    f32 gradient_scale = 0.01f / (f32)sample_count;
+    for (u32 i = 0; i < model->cost_graph.size; i++) {
+        Var* var = model->cost_graph.vars[i];
+        if (!(var->flags & VAR_FLAG_PARAMETER)) continue;
+        scale(var->grad, gradient_scale);
+        sub(var->val, var->val, var->grad);
+    }
+
+    free(returns);
+    if (!save_policy(checkpoint_path, model)) return false;
+    printf("LEARNED %u\n", sample_count);
+    return true;
+}
+
 static int run_agent(model_state* model, SnakeENV* env, mem_arena* arena, u32 epochs, b32 force_retrain) {
     const char* checkpoint_path = getenv("SNAKE_POLICY_PATH");
     if (!checkpoint_path || !checkpoint_path[0]) checkpoint_path = "Snake-policy.bin";
@@ -138,7 +210,9 @@ static int run_agent(model_state* model, SnakeENV* env, mem_arena* arena, u32 ep
     model_state inference_model = { 0 };
     create_actor_model(arena, &inference_model, 1);
     inference_model.forward_graph = build_graph(arena, &inference_model, inference_model.output);
-    if (!inference_model.forward_graph.vars || !copy_policy_parameters(model, &inference_model)) {
+    inference_model.cost_graph = build_graph(arena, &inference_model, inference_model.cost);
+    if (!inference_model.forward_graph.vars || !inference_model.cost_graph.vars ||
+        !copy_policy_parameters(model, &inference_model)) {
         fprintf(stderr, "Failed to create inference model.\n");
         return 1;
     }
@@ -146,9 +220,62 @@ static int run_agent(model_state* model, SnakeENV* env, mem_arena* arena, u32 ep
     puts("READY");
 
     char line[8192];
+    OnlineSample* samples = NULL;
+    u32 sample_count = 0, sample_capacity = 0;
+    f32 pending_observation[OBSERVATION_SIZE];
+    ACTION pending_action = NONE;
+    b32 has_pending_action = false;
+    int result = 0;
     while (fgets(line, sizeof(line), stdin)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strcmp(line, "ABORT") == 0) {
+            sample_count = 0;
+            has_pending_action = false;
+            continue;
+        }
+        if (strcmp(line, "END") == 0) {
+            if (has_pending_action) {
+                puts("ERROR cannot end episode before feedback");
+                continue;
+            }
+            if (!update_online_policy(model, samples, sample_count, checkpoint_path)) {
+                puts("ERROR online policy update or checkpoint save failed");
+                result = 1;
+                break;
+            }
+            sample_count = 0;
+            continue;
+        }
+        if (strncmp(line, "FEEDBACK ", 9) == 0) {
+            f32 reward = 0.0f;
+            unsigned int done = 0;
+            char extra;
+            if (sscanf(line + 9, "%f %u %c", &reward, &done, &extra) != 2 ||
+                !isfinite(reward) || done > 1 || !has_pending_action) {
+                puts("ERROR invalid or unexpected episode feedback");
+                continue;
+            }
+            if (!append_online_sample(&samples, &sample_count, &sample_capacity,
+                                      pending_observation, pending_action, reward)) {
+                puts("ERROR could not allocate online learning samples");
+                result = 1;
+                break;
+            }
+            has_pending_action = false;
+            if (done) {
+                if (!update_online_policy(model, samples, sample_count, checkpoint_path)) {
+                    puts("ERROR online policy update or checkpoint save failed");
+                    result = 1;
+                    break;
+                }
+                sample_count = 0;
+            }
+            continue;
+        }
+
         f32 observation[OBSERVATION_SIZE];
         char* cursor = line;
+        if (strncmp(cursor, "STEP ", 5) == 0) cursor += 5;
         b32 valid = true;
         for (u32 i = 0; i < OBSERVATION_SIZE; i++) {
             char* end = NULL;
@@ -160,9 +287,9 @@ static int run_agent(model_state* model, SnakeENV* env, mem_arena* arena, u32 ep
             cursor = end;
         }
         while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' || *cursor == '\n') cursor++;
-        if (*cursor != '\0') valid = false;
+        if (*cursor != '\0' || has_pending_action) valid = false;
         if (!valid) {
-            puts("ERROR invalid observation");
+            puts("ERROR invalid observation or missing feedback");
             continue;
         }
 
@@ -198,9 +325,13 @@ static int run_agent(model_state* model, SnakeENV* env, mem_arena* arena, u32 ep
             model->input->val->data[(u64)row * model->input->val->cols] = observation[row];
         }
         forward_pass(&model->forward_graph);
-        printf("ACTION %u\n", (u32)best_action_col(model->output->val, 0, pov, head, food, tail, body, body_len, env->cols, env->rows));
+        pending_action = best_action_col(model->output->val, 0, pov, head, food, tail, body, body_len, env->cols, env->rows);
+        memcpy(pending_observation, observation, sizeof(pending_observation));
+        has_pending_action = true;
+        printf("ACTION %u\n", (u32)pending_action);
     }
-    return 0;
+    free(samples);
+    return result;
 }
 
 int main(int argc, char** argv) {
