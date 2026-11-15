@@ -28,23 +28,30 @@ The source trains in a 16x16 environment using batches of 32 independent traject
 
 ## Build
 
-Run the following command in the project directory:
+Build from the project directory with a C11 compiler. These commands avoid CPU-specific optimization flags such as `-march=native`; the executable is still specific to its operating system and CPU architecture.
 
 ```powershell
-gcc -std=c11 -Wall -Wextra -O3 -march=native -funroll-loops -ffast-math Snake.c arena.c random.c environment.c matrix.c model.c training.c -lm -o Snake.exe
+gcc -std=c11 -O2 -Wall -Wextra Snake.c arena.c random.c environment.c matrix.c model.c training.c -lm -o Snake.exe
 ```
 
-The arena aligns memory using a pointer-width integer, so this build avoids pointer-size conversion warnings on both 32-bit and 64-bit Windows. With GCC or MinGW installed under a different command name, replace `gcc` with that compiler executable. The added vectorization flags target the local machine's CPU and help the training loop and matrix math run faster.
+On Windows, install GCC through MinGW-w64 and run this command in PowerShell. Launch the result with:
 
-On Linux, use the same source list and name the output `Snake`:
+```powershell
+.\Snake.exe
+```
+
+On Linux or macOS, use GCC or Clang via `cc` and run:
 
 ```sh
-gcc -std=c11 -Wall -Wextra -O3 -march=native -funroll-loops -ffast-math Snake.c arena.c random.c environment.c matrix.c model.c training.c -lm -o Snake
+cc -std=c11 -O2 -Wall -Wextra Snake.c arena.c random.c environment.c matrix.c model.c training.c -lm -o Snake
+./Snake
 ```
+
+Use Docker to build the image for the platform selected by Docker; use Docker Buildx when targeting a different platform.
 
 ## Docker
 
-The image uses a build stage to compile the C agent once. The runtime stage includes Python/Pygame and the prebuilt agent, but not GCC, so starting the game does not trigger another compilation. A named volume keeps trained weights between disposable containers.
+The Dockerfile builds a Linux image and compiles the C agent inside it, so the host does not need GCC or Python installed. Docker Desktop must be configured for Linux containers. The runtime stage includes Python/Pygame and the prebuilt agent, but not GCC, so starting the game does not trigger another compilation. A named volume keeps trained weights between disposable containers.
 
 ```sh
 docker build -t snake-rl .
@@ -70,7 +77,7 @@ To retrain from scratch at container startup instead of loading the saved policy
 docker run --rm -v snake-policy:/data -e DISPLAY=host.docker.internal:0.0 snake-rl --retrain
 ```
 
-This replaces `/data/Snake-policy.bin` in the mounted volume. You can also start the normal AI game and use **AUTO TRAIN** to retrain from the game window.
+This replaces `/data/Snake-policy.bin` in the mounted volume. The game-window **AUTO LEARN** mode instead continues the saved policy and replays recent experience while it learns; the policy and replay data are both kept in the mounted volume.
 
 To run only C training without a display:
 
@@ -94,11 +101,11 @@ py -3.13 -m venv .venv
 
 To launch the AI game without a console window, double-click `run_snake.vbs`.
 
-The game opens in human mode. Choose **C POLICY** to load the saved policy (or train if none exists) and watch it play. Choose **AUTO TRAIN** to retrain a fresh policy and then start AI play. Locally, weights are saved to `Snake-policy.bin`. In Docker, `SNAKE_POLICY_PATH` points to `/data/Snake-policy.bin`; use the documented `snake-policy` volume to keep trained weights across container runs. Use `.\.venv\Scripts\python.exe snake.py --ai --retrain` to force training from the command line, or pass an epoch count such as `.\.venv\Scripts\python.exe snake.py --ai --retrain --epochs 50`.
+The game opens in human mode. Choose **C POLICY** to load the saved policy (or train if none exists) and watch it play. Choose **AUTO LEARN** to continue the saved policy and learn from a persistent replay of recent AI experience. It keeps up to 2,048 state/action examples in `Snake-policy.bin.replay.bin` and saves policy updates to `Snake-policy.bin`; the replay file follows `SNAKE_POLICY_PATH` and is also retained by the Docker volume. Use `.\.venv\Scripts\python.exe snake.py --ai --retrain` to force fresh training from the command line, or pass an epoch count such as `.\.venv\Scripts\python.exe snake.py --ai --retrain --epochs 50`.
 
 Use the arrow keys or WASD to steer, Space to pause, and R to restart. Click the steps-per-second field, type a value from 2 to 45, and press Enter to apply it; + or - still adjusts the speed. The game runs at 45 steps per second by default.
 
-In C POLICY mode, each completed run provides reward feedback to the agent: collecting food and moving toward food are rewarded, while crashing is penalized. At the end of a run, the agent applies an online REINFORCE update and saves the revised policy to the checkpoint. The game indicates when the policy has been updated.
+In C POLICY mode, each completed run provides reward feedback to the agent: collecting food and moving toward food are rewarded, while crashing is penalized. At the end of a run, the agent applies an online REINFORCE update and saves the revised policy to the checkpoint. AUTO LEARN also saves those experiences and reuses them on later updates. The game indicates when the policy has been updated.
 
 ## Developer Notes
 
