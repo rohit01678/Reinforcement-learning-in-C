@@ -7,7 +7,7 @@ RUN apt-get update \
 WORKDIR /build
 COPY *.c *.h ./
 
-RUN gcc -std=c11 -Wall -Wextra -O3 \
+RUN gcc -std=c11 -O2 -Wall -Wextra \
     Snake.c arena.c random.c environment.c matrix.c model.c training.c \
     -lm -o Snake
 
