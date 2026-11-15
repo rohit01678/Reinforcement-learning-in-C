@@ -116,9 +116,10 @@ class AgentBridge:
 	]
 	HEADERS = ["arena.h", "common.h", "environment.h", "matrix.h", "model.h", "random.h", "training.h"]
 
-	def __init__(self, epochs, retrain=False):
+	def __init__(self, epochs, retrain=False, replay=False):
 		self.epochs = epochs
 		self.retrain = retrain
+		self.replay = replay
 		self.events = queue.Queue()
 		self.process = None
 		self.thread = None
@@ -154,6 +155,8 @@ class AgentBridge:
 			command = [str(executable), "--agent", str(self.epochs)]
 			if self.retrain:
 				command.append("--retrain")
+			if self.replay:
+				command.append("--replay")
 			self.process = subprocess.Popen(
 				command,
 				cwd=ROOT,
@@ -342,16 +345,20 @@ def draw_game(screen, world, mode, paused, bridge_state, progress, error, speed,
 	retrain_rect = pygame.Rect(panel_x + 286, BOARD_Y + 48, 170, 42)
 	draw_button(screen, human_rect, "HUMAN", mode == "human", label)
 	draw_button(screen, ai_rect, "C POLICY", mode == "ai", label)
-	draw_button(screen, retrain_rect, "AUTO TRAIN", bridge_state == "training", label)
+	draw_button(screen, retrain_rect, "AUTO LEARN", mode == "learn", label)
 	status_y = BOARD_Y + 106
 	if error:
 		draw_text(screen, small, "AGENT ERROR", (panel_x + 20, status_y), CORAL)
 	elif bridge_state == "ready":
-		status = f"POLICY UPDATED x{policy_updates}" if policy_updates else "POLICY ONLINE"
+		if mode == "learn":
+			status = f"REPLAY LEARNING x{policy_updates}"
+		else:
+			status = f"POLICY UPDATED x{policy_updates}" if policy_updates else "POLICY ONLINE"
 		draw_text(screen, small, status, (panel_x + 20, status_y), CYAN)
 	elif bridge_state == "training":
 		percentage = int(100 * progress[0] / max(progress[1], 1))
-		draw_text(screen, small, f"TRAINING C POLICY  {percentage}%", (panel_x + 20, status_y), CYAN)
+		training_label = "LEARNING FROM REPLAY" if mode == "learn" else "TRAINING C POLICY"
+		draw_text(screen, small, f"{training_label}  {percentage}%", (panel_x + 20, status_y), CYAN)
 		bar = pygame.Rect(panel_x + 248, status_y + 2, 150, 9)
 		pygame.draw.rect(screen, PANEL_ALT, bar, border_radius=4)
 		pygame.draw.rect(screen, CYAN, (bar.x, bar.y, int(bar.width * percentage / 100), bar.height), border_radius=4)
@@ -430,23 +437,22 @@ def main():
 	speed_input_rect = pygame.Rect(0, 0, 0, 0)
 	running = True
 
-	def choose_mode(new_mode, force_retrain=False):
+	def choose_mode(new_mode):
 		nonlocal mode, bridge, bridge_state, error, awaiting_action, discard_action, progress, policy_updates
 		error = ""
-		if new_mode == "ai" and force_retrain:
-			if bridge is not None:
-				bridge.stop()
-				bridge = None
+		if new_mode in ("ai", "learn") and bridge is not None and bridge.replay != (new_mode == "learn"):
+			bridge.stop()
+			bridge = None
 			bridge_state = "idle"
 			awaiting_action = False
 			discard_action = False
 			progress = (0, args.epochs)
 			policy_updates = 0
-		if new_mode == "ai" and bridge is None:
-			bridge = AgentBridge(args.epochs, force_retrain or args.retrain)
+		if new_mode in ("ai", "learn") and bridge is None:
+			bridge = AgentBridge(args.epochs, args.retrain, new_mode == "learn")
 			bridge_state = "training"
 			bridge.start()
-		if new_mode != mode and mode == "ai" and bridge is not None and bridge_state == "ready":
+		if new_mode != mode and mode in ("ai", "learn") and bridge is not None and bridge_state == "ready":
 			if awaiting_action:
 				if not bridge.abort_episode():
 					error = "Could not discard the pending C policy action."
@@ -477,7 +483,7 @@ def main():
 				elif ai_button.collidepoint(event.pos):
 					choose_mode("ai")
 				elif retrain_button.collidepoint(event.pos):
-					choose_mode("ai", force_retrain=True)
+					choose_mode("learn")
 			elif event.type == pygame.KEYDOWN:
 				if speed_input_active:
 					if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
@@ -505,7 +511,7 @@ def main():
 					paused = not paused
 					next_step = now + 1.0 / speed
 				elif event.key == pygame.K_r:
-					if mode == "ai" and bridge is not None and bridge_state == "ready" and not world.game_over:
+					if mode in ("ai", "learn") and bridge is not None and bridge_state == "ready" and not world.game_over:
 						if awaiting_action:
 							if not bridge.abort_episode():
 								error = "Could not discard the pending C policy action."
@@ -554,7 +560,7 @@ def main():
 					awaiting_action = False
 					if discard_action:
 						discard_action = False
-					elif mode == "ai" and not paused and not world.game_over:
+					elif mode in ("ai", "learn") and not paused and not world.game_over:
 						world.step(data)
 						if not bridge.feedback(world.last_reward, world.game_over):
 							error = "Could not send episode feedback to the C agent."
@@ -572,7 +578,7 @@ def main():
 			if mode == "human" and now >= next_step:
 				world.step(world.direction)
 				next_step = now + 1.0 / speed
-			elif mode == "ai" and bridge_state == "ready" and not awaiting_action and now >= next_step:
+			elif mode in ("ai", "learn") and bridge_state == "ready" and not awaiting_action and now >= next_step:
 				awaiting_action = bridge.send(world.observation())
 				next_step = now + 1.0 / speed
 				if not awaiting_action:
