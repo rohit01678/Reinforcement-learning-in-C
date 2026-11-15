@@ -1,8 +1,11 @@
 #define _CRT_SECURE_NO_WARNINGS
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define REPLAY_CAPACITY 2048
 
 #include "arena.h"
 #include "environment.h"
@@ -132,6 +135,18 @@ typedef struct {
     f32 reward;
 } OnlineSample;
 
+typedef struct {
+    f32 observation[OBSERVATION_SIZE];
+    ACTION action;
+    f32 advantage;
+} ReplaySample;
+
+typedef struct {
+    ReplaySample* samples;
+    u32 count;
+    u32 next_index;
+} ReplayBuffer;
+
 static b32 append_online_sample(OnlineSample** samples, u32* count, u32* capacity, const f32* observation, ACTION action, f32 reward) {
     if (*count == *capacity) {
         u32 new_capacity = *capacity ? *capacity * 2 : 256;
@@ -150,7 +165,96 @@ static b32 append_online_sample(OnlineSample** samples, u32* count, u32* capacit
     return true;
 }
 
-static b32 update_online_policy(model_state* model, const OnlineSample* samples, u32 sample_count, const char* checkpoint_path) {
+static void append_replay_sample(ReplayBuffer* replay, const ReplaySample* sample) {
+    if (replay->count < REPLAY_CAPACITY) {
+        replay->samples[replay->count++] = *sample;
+        replay->next_index = replay->count % REPLAY_CAPACITY;
+    } else {
+        replay->samples[replay->next_index] = *sample;
+        replay->next_index = (replay->next_index + 1) % REPLAY_CAPACITY;
+    }
+}
+
+static const ReplaySample* replay_sample_at(const ReplayBuffer* replay, u32 index) {
+    u32 oldest = replay->count == REPLAY_CAPACITY ? replay->next_index : 0;
+    return &replay->samples[(oldest + index) % REPLAY_CAPACITY];
+}
+
+static b32 load_replay(const char* path, ReplayBuffer* replay) {
+    static const char magic[8] = { 'S', 'N', 'A', 'K', 'E', 'R', 'P', '1' };
+    FILE* file = fopen(path, "rb");
+    if (!file) {
+        if (errno == ENOENT) return true;
+        fprintf(stderr, "Could not open experience replay: %s\n", path);
+        return false;
+    }
+
+    char file_magic[sizeof(magic)];
+    u32 version = 0, observation_size = 0, capacity = 0, count = 0;
+    b32 valid = fread(file_magic, sizeof(file_magic), 1, file) == 1 &&
+                fread(&version, sizeof(version), 1, file) == 1 &&
+                fread(&observation_size, sizeof(observation_size), 1, file) == 1 &&
+                fread(&capacity, sizeof(capacity), 1, file) == 1 &&
+                fread(&count, sizeof(count), 1, file) == 1 &&
+                memcmp(file_magic, magic, sizeof(magic)) == 0 && version == 1 &&
+                observation_size == OBSERVATION_SIZE && capacity == REPLAY_CAPACITY &&
+                count <= REPLAY_CAPACITY;
+
+    ReplaySample* loaded = valid ? malloc(sizeof(*loaded) * REPLAY_CAPACITY) : NULL;
+    if (!loaded) valid = false;
+    for (u32 i = 0; valid && i < count; i++) {
+        u32 action = 0;
+        valid = fread(loaded[i].observation, sizeof(f32), OBSERVATION_SIZE, file) == OBSERVATION_SIZE &&
+                fread(&action, sizeof(action), 1, file) == 1 &&
+                fread(&loaded[i].advantage, sizeof(f32), 1, file) == 1 &&
+                action <= DOWN && isfinite(loaded[i].advantage);
+        for (u32 j = 0; valid && j < OBSERVATION_SIZE; j++) {
+            if (!isfinite(loaded[i].observation[j])) valid = false;
+        }
+        loaded[i].action = (ACTION)action;
+    }
+    if (valid && (fgetc(file) != EOF || ferror(file))) valid = false;
+    fclose(file);
+
+    if (!valid) {
+        fprintf(stderr, "Ignoring invalid experience replay: %s\n", path);
+        free(loaded);
+        return true;
+    }
+    memcpy(replay->samples, loaded, sizeof(*loaded) * count);
+    replay->count = count;
+    replay->next_index = count % REPLAY_CAPACITY;
+    free(loaded);
+    fprintf(stderr, "Loaded %u experience replay samples.\n", replay->count);
+    return true;
+}
+
+static b32 save_replay(const char* path, const ReplayBuffer* replay) {
+    static const char magic[8] = { 'S', 'N', 'A', 'K', 'E', 'R', 'P', '1' };
+    u32 version = 1;
+    u32 observation_size = OBSERVATION_SIZE;
+    u32 capacity = REPLAY_CAPACITY;
+    FILE* file = fopen(path, "wb");
+    if (!file) return false;
+
+    b32 success = fwrite(magic, sizeof(magic), 1, file) == 1 &&
+                  fwrite(&version, sizeof(version), 1, file) == 1 &&
+                  fwrite(&observation_size, sizeof(observation_size), 1, file) == 1 &&
+                  fwrite(&capacity, sizeof(capacity), 1, file) == 1 &&
+                  fwrite(&replay->count, sizeof(replay->count), 1, file) == 1;
+    for (u32 i = 0; success && i < replay->count; i++) {
+        const ReplaySample* sample = replay_sample_at(replay, i);
+        u32 action = (u32)sample->action;
+        success = fwrite(sample->observation, sizeof(f32), OBSERVATION_SIZE, file) == OBSERVATION_SIZE &&
+                  fwrite(&action, sizeof(action), 1, file) == 1 &&
+                  fwrite(&sample->advantage, sizeof(f32), 1, file) == 1;
+    }
+    if (fclose(file) != 0) success = false;
+    return success;
+}
+
+static b32 update_online_policy(model_state* model, const OnlineSample* samples, u32 sample_count,
+                                const char* checkpoint_path, ReplayBuffer* replay, const char* replay_path) {
     if (sample_count == 0) return true;
 
     f32* returns = malloc(sizeof(*returns) * sample_count);
@@ -169,21 +273,48 @@ static b32 update_online_policy(model_state* model, const OnlineSample* samples,
     f32 variance = total_return_squared / (f32)sample_count - mean_return * mean_return;
     f32 std_return = sqrtf(MAX(variance, 0.0f));
 
+    if (replay) {
+        for (u32 i = 0; i < sample_count; i++) {
+            ReplaySample replay_sample = { 0 };
+            memcpy(replay_sample.observation, samples[i].observation, sizeof(replay_sample.observation));
+            replay_sample.action = samples[i].action;
+            replay_sample.advantage = std_return > 1e-6f ? (returns[i] - mean_return) / std_return : returns[i];
+            append_replay_sample(replay, &replay_sample);
+        }
+        if (!save_replay(replay_path, replay)) {
+            free(returns);
+            return false;
+        }
+    }
+
+    u32 training_count = replay ? replay->count : sample_count;
     for (u32 i = 0; i < model->cost_graph.size; i++) {
         Var* var = model->cost_graph.vars[i];
         if (var->flags & VAR_FLAG_PARAMETER) clear(var->grad);
     }
 
-    for (u32 i = 0; i < sample_count; i++) {
-        memcpy(model->input->val->data, samples[i].observation, sizeof(samples[i].observation));
+    for (u32 i = 0; i < training_count; i++) {
+        const f32* observation;
+        ACTION action;
+        f32 advantage;
+        if (replay) {
+            const ReplaySample* replay_sample = replay_sample_at(replay, i);
+            observation = replay_sample->observation;
+            action = replay_sample->action;
+            advantage = replay_sample->advantage;
+        } else {
+            observation = samples[i].observation;
+            action = samples[i].action;
+            advantage = std_return > 1e-6f ? (returns[i] - mean_return) / std_return : returns[i];
+        }
+        memcpy(model->input->val->data, observation, sizeof(samples[i].observation));
         clear(model->advantage->val);
-        f32 advantage = std_return > 1e-6f ? (returns[i] - mean_return) / std_return : returns[i];
-        model->advantage->val->data[(u64)samples[i].action * model->advantage->val->cols] = advantage;
+        model->advantage->val->data[(u64)action * model->advantage->val->cols] = advantage;
         forward_pass(&model->cost_graph);
         backward_pass(&model->cost_graph);
     }
 
-    f32 gradient_scale = 0.01f / (f32)sample_count;
+    f32 gradient_scale = 0.01f / (f32)training_count;
     for (u32 i = 0; i < model->cost_graph.size; i++) {
         Var* var = model->cost_graph.vars[i];
         if (!(var->flags & VAR_FLAG_PARAMETER)) continue;
@@ -197,7 +328,7 @@ static b32 update_online_policy(model_state* model, const OnlineSample* samples,
     return true;
 }
 
-static int run_agent(model_state* model, SnakeENV* env, mem_arena* arena, u32 epochs, b32 force_retrain) {
+static int run_agent(model_state* model, SnakeENV* env, mem_arena* arena, u32 epochs, b32 force_retrain, b32 use_replay) {
     const char* checkpoint_path = getenv("SNAKE_POLICY_PATH");
     if (!checkpoint_path || !checkpoint_path[0]) checkpoint_path = "Snake-policy.bin";
     if (force_retrain || !load_policy(checkpoint_path, model)) {
@@ -217,6 +348,37 @@ static int run_agent(model_state* model, SnakeENV* env, mem_arena* arena, u32 ep
         return 1;
     }
     model = &inference_model;
+
+    ReplayBuffer replay = { 0 };
+    char* replay_path = NULL;
+    if (use_replay) {
+        size_t path_length = strlen(checkpoint_path);
+        if (path_length > SIZE_MAX - sizeof(".replay.bin")) {
+            fprintf(stderr, "Experience replay path is too long.\n");
+            return 1;
+        }
+        replay_path = malloc(path_length + sizeof(".replay.bin"));
+        replay.samples = malloc(sizeof(*replay.samples) * REPLAY_CAPACITY);
+        if (!replay_path || !replay.samples) {
+            fprintf(stderr, "Failed to allocate experience replay.\n");
+            free(replay_path);
+            free(replay.samples);
+            return 1;
+        }
+        snprintf(replay_path, path_length + sizeof(".replay.bin"), "%s.replay.bin", checkpoint_path);
+        if (force_retrain) {
+            if (!save_replay(replay_path, &replay)) {
+                fprintf(stderr, "Could not reset experience replay.\n");
+                free(replay_path);
+                free(replay.samples);
+                return 1;
+            }
+        } else if (!load_replay(replay_path, &replay)) {
+            free(replay_path);
+            free(replay.samples);
+            return 1;
+        }
+    }
     puts("READY");
 
     char line[8192];
@@ -238,7 +400,8 @@ static int run_agent(model_state* model, SnakeENV* env, mem_arena* arena, u32 ep
                 puts("ERROR cannot end episode before feedback");
                 continue;
             }
-            if (!update_online_policy(model, samples, sample_count, checkpoint_path)) {
+            if (!update_online_policy(model, samples, sample_count, checkpoint_path,
+                                      use_replay ? &replay : NULL, replay_path)) {
                 puts("ERROR online policy update or checkpoint save failed");
                 result = 1;
                 break;
@@ -263,7 +426,8 @@ static int run_agent(model_state* model, SnakeENV* env, mem_arena* arena, u32 ep
             }
             has_pending_action = false;
             if (done) {
-                if (!update_online_policy(model, samples, sample_count, checkpoint_path)) {
+                if (!update_online_policy(model, samples, sample_count, checkpoint_path,
+                                          use_replay ? &replay : NULL, replay_path)) {
                     puts("ERROR online policy update or checkpoint save failed");
                     result = 1;
                     break;
@@ -331,6 +495,8 @@ static int run_agent(model_state* model, SnakeENV* env, mem_arena* arena, u32 ep
         printf("ACTION %u\n", (u32)pending_action);
     }
     free(samples);
+    free(replay_path);
+    free(replay.samples);
     return result;
 }
 
@@ -339,28 +505,32 @@ int main(int argc, char** argv) {
 
     b32 agent_mode = argc > 1 && strcmp(argv[1], "--agent") == 0;
     if (argc > 1 && !agent_mode) {
-        fprintf(stderr, "Usage: %s [--agent [epochs] [--retrain]]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [--agent [epochs] [--retrain] [--replay]]\n", argv[0]);
         return 2;
     }
 
     u32 epochs = DEFAULT_TRAINING_EPOCHS;
     b32 force_retrain = false;
-    if (argc > 2 && strcmp(argv[2], "--retrain") == 0) {
-        force_retrain = true;
-        if (argc > 3) {
+    b32 use_replay = false;
+    b32 has_epoch_count = false;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--retrain") == 0 && !force_retrain) {
+            force_retrain = true;
+        } else if (strcmp(argv[i], "--replay") == 0 && !use_replay) {
+            use_replay = true;
+        } else if (!has_epoch_count) {
+            char* end = NULL;
+            unsigned long parsed = strtoul(argv[i], &end, 10);
+            if (*argv[i] == '\0' || *end != '\0' || parsed > 1000000) {
+                fprintf(stderr, "Invalid agent arguments.\n");
+                return 2;
+            }
+            epochs = (u32)parsed;
+            has_epoch_count = true;
+        } else {
             fprintf(stderr, "Invalid agent arguments.\n");
             return 2;
         }
-    } else if (argc > 2) {
-        char* end = NULL;
-        unsigned long parsed = strtoul(argv[2], &end, 10);
-        if (*argv[2] == '\0' || *end != '\0' || parsed > 1000000 || argc > 4 ||
-            (argc > 3 && strcmp(argv[3], "--retrain") != 0)) {
-            fprintf(stderr, "Invalid agent epoch count.\n");
-            return 2;
-        }
-        epochs = (u32)parsed;
-        force_retrain = argc > 3;
     }
 
     mem_arena* arena = arena_create(MiB(64));
@@ -395,7 +565,7 @@ int main(int argc, char** argv) {
 
     int result = 0;
     if (agent_mode) {
-        result = run_agent(model, env, arena, epochs, force_retrain);
+        result = run_agent(model, env, arena, epochs, force_retrain, use_replay);
     } else {
         printf("Starting Training Loop...\n");
         train(model, env, arena, epochs);
