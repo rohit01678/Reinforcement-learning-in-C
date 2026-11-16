@@ -168,4 +168,7 @@ Grid size, batch size, episode length, and default epochs are defined in `common
 ## Notes
 
 This is a small educational implementation. It demonstrates core reinforcement-learning and neural-network concepts directly in C, but it does not include the optimizations, stability features, or tooling found in production ML frameworks.
-   
+
+## Message
+
+This project is complete from my side. If anyone wants to make adjustments or improvements to this code, they are welcome to do so.
