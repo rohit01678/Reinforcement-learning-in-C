@@ -99,9 +99,20 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe snake.py
 ```
 
-To launch the AI game without a console window, double-click `run_snake.vbs`.
+The game opens in human mode. Choose **C POLICY** to load the saved policy (or train if none exists) and watch it play. Choose **AUTO LEARN** to continue the saved policy and learn from a persistent replay of recent AI experience. It keeps up to 2,048 state/action examples in `Snake-policy.bin.replay.bin` and saves policy updates to `Snake-policy.bin`; the replay file follows `SNAKE_POLICY_PATH` and is also retained by the Docker volume.
 
-The game opens in human mode. Choose **C POLICY** to load the saved policy (or train if none exists) and watch it play. Choose **AUTO LEARN** to continue the saved policy and learn from a persistent replay of recent AI experience. It keeps up to 2,048 state/action examples in `Snake-policy.bin.replay.bin` and saves policy updates to `Snake-policy.bin`; the replay file follows `SNAKE_POLICY_PATH` and is also retained by the Docker volume. Use `.\.venv\Scripts\python.exe snake.py --ai --retrain` to force fresh training from the command line, or pass an epoch count such as `.\.venv\Scripts\python.exe snake.py --ai --retrain --epochs 50`.
+To start directly in C-policy mode, use:
+
+```powershell
+.\.venv\Scripts\python.exe snake.py --ai
+```
+
+Use `--retrain` to ignore the saved policy and train from scratch, or `--epochs` to choose the number of training epochs:
+
+```powershell
+.\.venv\Scripts\python.exe snake.py --ai --retrain
+.\.venv\Scripts\python.exe snake.py --ai --retrain --epochs 50
+```
 
 Use the arrow keys or WASD to steer, Space to pause, and R to restart. Click the steps-per-second field, type a value from 2 to 45, and press Enter to apply it; + or - still adjusts the speed. The game runs at 45 steps per second by default.
 
@@ -162,7 +173,6 @@ Grid size, batch size, episode length, and default epochs are defined in `common
 |-- training.h    Training interface
 |-- Snake.c       Training entry point and C policy interface
 |-- snake.py     Pygame game and C-policy bridge
-|-- run_snake.vbs Hidden-console AI game launcher for Windows
 ```
 
 ## Notes
